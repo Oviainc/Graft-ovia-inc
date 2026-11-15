@@ -13,6 +13,8 @@
  * map — routes through {@link savingsFor} + {@link withSavings} here.
  */
 import type { GraphV1 } from '../graph/types.js';
+import { formatDollars } from './price.js';
+import { brand, tag } from "../brand.js";
 
 export interface Savings {
   /** How many source files the baseline covers. */
@@ -52,14 +54,77 @@ export function savingsFor(graph: GraphV1, paths: Iterable<string>): Savings | u
   return files > 0 ? { files, baselineChars } : undefined;
 }
 
+/**
+ * The blended input rate this session is paying, in $/Mtok, or null when nobody
+ * has measured one.
+ *
+ * Process-level because it is a process-level fact: one CLI invocation answers
+ * one query for one session, and the alternative — threading a rate through
+ * `withSavings` and all seven of its callers — would put a billing parameter in
+ * the signature of every retrieval formatter for no gain. Set by the CLI's
+ * `noteQuery` and by the MCP dispatch, both of which already resolve the repo
+ * root; unset everywhere else, which is why every consumer treats null as
+ * "report tokens only" rather than as zero.
+ */
+let inputRateUsdPerMtok: number | null = null;
+
+/** Tell this module what an input token costs here. Null clears it, and so does
+ * anything that isn't a positive finite number — a NaN from a zero-denominator
+ * rate must render as "no dollars known", never as `$NaN` in the agent's face. */
+export function setInputRate(usdPerMtok: number | null): void {
+  inputRateUsdPerMtok =
+    typeof usdPerMtok === 'number' && Number.isFinite(usdPerMtok) && usdPerMtok > 0
+      ? usdPerMtok
+      : null;
+}
+
 /** Appended to every retrieval footer so the agent reports the turn's running
  * total even when SKILL.md isn't loaded — the instruction rides along in the
  * tool output itself. Deliberately free of the `[graft] tokens saved ≈ <n>`
  * pattern so the PostToolUse accumulator that parses these footers never
- * mistakes the nudge (or its example) for a second number to count. */
-export const SAVINGS_TURN_NUDGE =
-  ' At the end of your reply, tell the user the total graft tokens saved this ' +
-  'turn — sum each such line across your graft calls — e.g. "🌱 graft saved ~N tokens this turn".';
+ * mistakes the nudge (or its example) for a second number to count.
+ *
+ * Carries this call's dollar value once a rate has been measured, because the
+ * agent has no way to price a token itself — the ask it's given has to contain
+ * the number, not just request one. The example phrasing stays inside what
+ * `hasSavingsTally` (claude/tally.ts) recognises, so adding money here does not
+ * quietly zero the reported-turns metric. */
+export function savingsTurnNudge(savedTokens: number): string {
+  const b = brand();
+  const sum = ` — sum each such line across your ${b} calls — e.g. `;
+  if (inputRateUsdPerMtok === null || savedTokens <= 0) {
+    return (
+      ` At the end of your reply, tell the user the total ${b} tokens saved ` +
+      `this turn${sum}"🌱 ${b} saved ~N tokens this turn".`
+    );
+  }
+  const usd = (savedTokens * inputRateUsdPerMtok) / 1_000_000;
+  return (
+    ` This call is worth ${formatDollars(usd)} at the rate this session is ` +
+    'actually paying for input tokens. At the end of your reply, tell the user ' +
+    `the total ${brand()} tokens saved this turn and what they were worth${sum}` +
+    `"🌱 ${brand()} saved ~N tokens (~$X) this turn".`
+  );
+}
+
+/**
+ * Digits grouped for display, pinned to en-US.
+ *
+ * Not a style choice: the `[graft] tokens saved ≈ N` line below is read back by
+ * {@link sumSavingsFooters}, whose regex knows `,` and nothing else. Rendered
+ * with the machine's locale instead, a de-DE or tr-TR box wrote `1.990` and
+ * graft parsed its own footer as `1` — every savings total downstream, and the
+ * dollar value beside it, off by a factor of a thousand (#338). fr-FR and ru-RU
+ * group with a narrow no-break space and lost it the same way.
+ *
+ * Every number graft renders goes through here, not only the parsed one: a
+ * statusline that grouped differently from the footer right above it would be
+ * its own small bug. `src/cli-epilogue.ts` pins the same way, for the same
+ * reason.
+ */
+export function groupDigits(n: number): string {
+  return n.toLocaleString('en-US');
+}
 
 /** The one-line savings estimate for a command's text output, so the agent gets
  * the number for free — no extra tool call. `body` is the exact rendered output
@@ -74,11 +139,27 @@ export function savingsLine(body: string, saved: Savings | undefined): string {
   const delta = base - pack;
   const pct = Math.round((delta / base) * 100);
   return (
-    `[graft] tokens saved ≈ ${delta.toLocaleString()} (${pct}%) — this output ≈ ` +
-    `${pack.toLocaleString()} tok vs reading the ${saved.files} file(s) it covers whole ≈ ` +
-    `${base.toLocaleString()} tok (estimate).` +
-    SAVINGS_TURN_NUDGE
+    `${tag()} tokens saved ≈ ${groupDigits(delta)} (${pct}%) — this output ≈ ` +
+    `${groupDigits(pack)} tok vs reading the ${saved.files} file(s) it covers whole ≈ ` +
+    `${groupDigits(base)} tok (estimate).` +
+    savingsTurnNudge(delta)
   );
+}
+
+/**
+ * Sum every `[graft] tokens saved ≈ N` footer in a blob of text — the reader
+ * half of {@link savingsLine}, kept next to the writer so the two never drift.
+ * A single blob can carry several (an agent that made two graft calls in one
+ * turn); the nudge from `savingsTurnNudge` deliberately omits the pattern, so its example
+ * text is not miscounted here.
+ */
+export function sumSavingsFooters(text: string): number {
+  let total = 0;
+  // The code a query saved reading, and the digging a reused learning saved.
+  for (const m of text.matchAll(/\[(?:graft|trail)\] (?:tokens|learnings) saved ≈ ([\d,]+)/g)) {
+    total += Number(m[1].replace(/,/g, '')) || 0;
+  }
+  return total;
 }
 
 /** Render `body` with the savings line on TOP.

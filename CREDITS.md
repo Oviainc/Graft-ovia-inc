@@ -2,7 +2,7 @@
 
 ## Language support
 
-graft's multi-language support was shaped by community contributors who opened
+The graft map's multi-language support was shaped by community contributors who opened
 language pull requests. That wave of one-language-at-a-time PRs is exactly what
 motivated the generic breadth tier (one tree-sitter grammar + `tags.scm` per
 language) that now covers most of them. With gratitude to:
@@ -16,6 +16,10 @@ language) that now covers most of them. With gratitude to:
   which the breadth tier addresses by routing unknown extensions to a generic
   extractor instead of skipping them.
 - **@kapelner** (#69) — C/C++; (#70) — R.
+- **@CroissantEdit** (#187) — Lua.
+- **@Ansh-Sonkusare** (#159) — Nix.
+- **@shovelmn12** (#130) — Kotlin, promoted to full-fidelity depth extraction.
+- **@mattstrayer** (#219) — Swift.
 
 If you contributed a language PR and aren't listed here, please open an issue —
 the omission is an oversight, not a slight.

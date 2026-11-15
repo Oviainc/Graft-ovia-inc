@@ -7,6 +7,7 @@
  * grounded in, so provenance (and staleness) stays exact.
  */
 import type { ChatModel } from "./llm/types.js";
+import { recoverToolArgsFromContent, warnToolChoiceIgnored } from "./llm/recover-tool.js";
 
 /** A directed edge to another node, by node name (resolved to a slug later). */
 export interface SynthLink {
@@ -87,8 +88,11 @@ const NODES_SCHEMA = {
   required: ["nodes"],
 } as const;
 
-/** Cap the total summary text sent in one call so it never blows the context. */
-const MAX_INPUT_CHARS = 60_000;
+/** Cap the total summary text sent in one call so it never blows the context.
+ *  Also the ceiling the synthesis batch budget is clamped to
+ *  (`context/batches.ts`): a batch planned past this would be recorded complete
+ *  while the call silently dropped its tail. */
+export const MAX_INPUT_CHARS = 60_000;
 
 function userContent(files: FileSummary[]): string {
   const body = files.map((f) => `## ${f.path}\n\n${f.summary}`).join("\n\n");
@@ -122,6 +126,95 @@ function clean(nodes: unknown): SynthNode[] {
   return out;
 }
 
+/**
+ * A forced `record_graph` call can still deliver `nodes` as a JSON *string*
+ * (double-encoded args). `clean` would then return [] and the CLI ticked
+ * `✓ concepts: 0 nodes` (#383). Parse, then salvage balanced `{"name":…}`
+ * objects if a stray brace breaks the string. Do not reuse recover-tool —
+ * that path only runs when there is no tool-call args object.
+ */
+function coerceRecordGraphNodes(nodes: unknown, toolCalls: number): unknown[] {
+  if (Array.isArray(nodes)) return nodes;
+  if (typeof nodes !== "string") return [];
+  let parsed: unknown;
+  let salvaged = 0;
+  try {
+    parsed = JSON.parse(nodes);
+  } catch {
+    const objs = salvageNamedObjects(nodes);
+    parsed = objs;
+    salvaged = objs.length;
+  }
+  const values = Array.isArray(parsed) ? parsed : [];
+  const salvageBit = salvaged > 0 ? ` — salvaged ${salvaged} node(s) from malformed JSON` : "";
+  console.error(
+    `⚠ synthesize: tool call returned "nodes" as a ${nodes.length}-char string, not an array; ${toolCalls} tool call(s)${salvageBit}`,
+  );
+  return values;
+}
+
+/** Pull complete `{"name":…}` objects out of a near-JSON string. */
+function salvageNamedObjects(raw: string): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = [];
+  for (let i = 0; i < raw.length; ) {
+    const start = raw.indexOf("{", i);
+    if (start === -1) break;
+    const end = balancedClose(raw, start);
+    if (end === -1) {
+      i = start + 1;
+      continue;
+    }
+    try {
+      const obj = JSON.parse(raw.slice(start, end + 1)) as unknown;
+      if (obj && typeof obj === "object" && !Array.isArray(obj) && typeof (obj as { name?: unknown }).name === "string") {
+        out.push(obj as Record<string, unknown>);
+      }
+    } catch {
+      /* slice was not a complete object */
+    }
+    i = end + 1;
+  }
+  return out;
+}
+
+function balancedClose(raw: string, start: number): number {
+  let depth = 0;
+  let inStr = false;
+  let escape = false;
+  for (let i = start; i < raw.length; i++) {
+    const c = raw[i]!;
+    if (inStr) {
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (c === "\\") {
+        escape = true;
+        continue;
+      }
+      if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') {
+      inStr = true;
+      continue;
+    }
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+function shapeOfNodes(nodes: unknown): string {
+  if (typeof nodes === "string") return `"nodes" is string, ${nodes.length} chars`;
+  if (Array.isArray(nodes)) return `"nodes" is array, ${nodes.length} entries`;
+  if (nodes === undefined) return `"nodes" is undefined`;
+  return `"nodes" is ${typeof nodes}`;
+}
+
 const RECORD_TOOL = "record_graph";
 
 /** Synthesizer backed by any {@link ChatModel} via forced tool calling. */
@@ -146,10 +239,31 @@ export class ChatSynthesizer implements Synthesizer {
         { role: "user", content: userContent(files) },
       ],
     });
-    const call = res.toolCalls[0];
-    if (!call) return [];
-    // `args` is already a parsed object — no JSON.parse.
-    return clean((call.args as { nodes?: unknown })?.nodes);
+    const raw = nodesFromResponse(res)?.nodes;
+    const out = clean(coerceRecordGraphNodes(raw, res.toolCalls.length));
+    if (out.length === 0) {
+      console.error(`⚠ synthesize: empty batch (${shapeOfNodes(raw)}; ${res.toolCalls.length} tool call(s))`);
+    }
+    return out;
   }
+}
+
+/**
+ * Prefer a real tool call; if the gateway ignored `tool_choice` (#129), recover
+ * the same payload from `content`. Recovered args still go through {@link clean}.
+ */
+function nodesFromResponse(res: { text: string; toolCalls: { name: string; args: unknown }[] }): {
+  nodes?: unknown;
+} | undefined {
+  const call = res.toolCalls.find((c) => c.name === RECORD_TOOL) ?? res.toolCalls[0];
+  if (call?.args && typeof call.args === "object" && !Array.isArray(call.args)) {
+    return call.args as { nodes?: unknown };
+  }
+  const recovered = recoverToolArgsFromContent(res.text, {
+    toolNames: [RECORD_TOOL, "emit_json"],
+    payloadKey: "nodes",
+  });
+  if (!recovered) warnToolChoiceIgnored("synthesize", res.text?.trim() ? "unparsed" : "empty");
+  return recovered as { nodes?: unknown } | undefined;
 }
 

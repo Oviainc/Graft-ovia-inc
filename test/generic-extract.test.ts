@@ -6,15 +6,25 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { warmGenericGrammars, extractGeneric, genericLangOf, isWarm } from "../src/graph/generic.js";
+import {
+  warmGenericGrammars,
+  extractGeneric,
+  genericLangOf,
+  isWarm,
+  loadWasmLanguage,
+  parseWasm,
+  swapGrammarForTest,
+  type TsNode,
+} from "../src/graph/generic.js";
 import { resolveEdges } from "../src/graph/resolve.js";
 import { buildGraph } from "../src/graph/build.js";
 import { readGraph, wiringPath } from "../src/graph/write.js";
 import { checkGraph } from "../src/graph/check.js";
 import { contextDirFor } from "../src/context/node-file.js";
+import { skeleton } from "../src/ask/ask.js";
 
 const RUST = `pub struct Config {
     name: String,
@@ -36,6 +46,9 @@ fn helper() -> String {
 
 test("genericLangOf routes .rs to the breadth tier (and not depth-tier extensions)", () => {
   assert.equal(genericLangOf("src/main.rs")?.name, "rust");
+  assert.equal(genericLangOf("src/init.lua")?.name, "lua");
+  assert.equal(genericLangOf("src/app.gleam")?.name, "gleam");
+  assert.equal(genericLangOf("src/DRM.jl")?.name, "julia");
   assert.equal(genericLangOf("src/app.ts"), null); // depth tier owns .ts
   assert.equal(genericLangOf("README.md"), null);
 });
@@ -106,6 +119,57 @@ const SNIPPETS: Array<{ lang: string; file: string; src: string; defs: string[];
     src: `(ns my.core)\n\n(defn helper [] 1)\n\n(defn run [] (helper))\n`,
     defs: ["function:helper", "function:run", "module:my.core"], call: ["run", "helper"],
   },
+  {
+    // Lua functions can be declarations, assigned expressions, or table fields;
+    // colon syntax defines and calls methods.
+    lang: "lua", file: "a.lua",
+    src: `local function helper()\n  return 1\nend\n\nlocal assigned = function()\n  return helper()\nend\n\nlocal handlers = { draw = function() return helper() end }\n\nfunction Widget:run()\n  return helper()\nend\n\nlocal function launch()\n  return Widget:run()\nend\n`,
+    defs: ["function:assigned", "function:draw", "function:helper", "function:launch", "method:run"], call: ["launch", "run"],
+  },
+  {
+    // Julia: long-form `function f(x) ... end`, short-form `f(x) = ...`, a
+    // qualified `Base.show(...)` method (last path segment), a `where` clause,
+    // a macro-annotated one-liner (`@inline`), structs / abstract types with a
+    // supertype, and `const`. A call on the LEFT of `=` is a definition; on the
+    // right it is a reference.
+    lang: "julia", file: "a.jl",
+    src: `module Foo\nabstract type AbstractModel end\nstruct Bar{T} <: AbstractModel\n  x::T\nend\nconst K = 3\nfunction fit(m::Bar, y)\n  helper(y) .+ K\nend\nhelper(y) = sum(y)\nBase.show(io::IO, b::Bar) = print(io, "Bar")\nf(x::T) where {T} = x\n@inline g(x) = f(x)\nend\n`,
+    defs: ["constant:K", "function:f", "function:fit", "function:g", "function:helper", "function:show", "module:Foo", "struct:Bar", "type:AbstractModel"], call: ["fit", "helper"],
+  },
+  {
+    // Nix: a binding whose value is a lambda (let-bound or attrset field) becomes
+    // a function def; a non-function binding (`version`) is not emitted, and an
+    // application of one binding by another resolves as a call.
+    lang: "nix", file: "a.nix",
+    src: `let\n  helper = x: x + 1;\nin {\n  greet = name: helper 2;\n  version = "1.0";\n}\n`,
+    defs: ["function:greet", "function:helper"], call: ["greet", "helper"],
+  },
+  {
+    // Gleam's module functions are declarations, while custom types are named
+    // through their nested `type_name` node. Constants and the variants of a
+    // custom type are API too — `Ready` is a callable you can pass around. A
+    // direct function call still resolves through the bare-name resolver.
+    lang: "gleam", file: "src/app.gleam",
+    src: `pub const limit = 3
+
+pub type State { Ready }
+
+pub fn helper() { 1 }
+
+pub fn run() { helper() }
+`,
+    defs: ["constant:limit", "function:Ready", "function:helper", "function:run", "type:State"],
+    call: ["run", "helper"],
+  },
+  {
+    // PowerShell: function/filter statements name via the function_name leaf
+    // token; bare command invocations (cmdlets, script functions) are calls.
+    // Bodies must put statements on their own lines — single-line
+    // `function f { param($x) ... }` hits a grammar ERROR region.
+    lang: "powershell", file: "a.ps1",
+    src: `function Get-Greeting {\n    param([string]$Name)\n    return "hi $Name"\n}\n\nfunction Show-All {\n    Get-Greeting -Name "world"\n}\n`,
+    defs: ["function:Get-Greeting", "function:Show-All"], call: ["Show-All", "Get-Greeting"],
+  },
 ];
 
 for (const s of SNIPPETS) {
@@ -121,6 +185,272 @@ for (const s of SNIPPETS) {
     assert.equal(call?.target, `${s.file}#${s.call[1]}`, `${s.lang}: resolved ${s.call[0]}→${s.call[1]}`);
   });
 }
+
+test("Gleam files build into a queryable wiring graph", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "graft-gleam-"));
+  try {
+    mkdirSync(join(dir, "src"));
+    writeFileSync(
+      join(dir, "src", "app.gleam"),
+      `pub type State { Ready }
+
+pub fn helper() { 1 }
+
+pub fn run() { helper() }
+`,
+    );
+
+    const built = await buildGraph(dir, { reuse: false });
+    assert.deepEqual(built.languages, ["gleam"]);
+
+    const graph = readGraph(wiringPath(built.contextDir));
+    assert.ok(graph?.nodes.some((n) => n.id === "src/app.gleam#State"));
+    assert.ok(graph?.edges.some((e) => e.source === "src/app.gleam#run" && e.target === "src/app.gleam#helper"));
+
+    const api = skeleton(dir, "src/app.gleam");
+    assert.deepEqual(api.entries.map((e) => e.name).sort(), ["Ready", "State", "helper", "run"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** A two-module Gleam package: `app.gleam` reaches `app/thing.gleam` every way
+ * Gleam offers, and reaches the stdlib the same way it reaches in-repo code. */
+function gleamPackage(dir: string): void {
+  mkdirSync(join(dir, "src", "app"), { recursive: true });
+  // A local function whose name collides with gleam/list's — the bait for a
+  // bare-name resolver. `Cfg` is the idiomatic type/constructor name collision.
+  writeFileSync(join(dir, "src", "mine.gleam"), `pub fn map(x: Int) -> Int { x }\n`);
+  writeFileSync(
+    join(dir, "src", "app", "thing.gleam"),
+    `pub type State {
+  Ready
+  Busy(since: Int)
+}
+
+pub type Cfg { Cfg(a: Int) }
+
+pub fn helper(n: Int) -> Int { n }
+`,
+  );
+  writeFileSync(
+    join(dir, "src", "app.gleam"),
+    `import gleam/list
+import app/thing
+import app/thing.{helper} as t
+
+pub fn run(xs: List(Int), c: thing.Cfg) -> thing.State {
+  list.map(xs, fn(x) { x })
+  thing.helper(1)
+  helper(2)
+  let s = thing.Busy(since: 1)
+  let _ = thing.Cfg(a: 2)
+  case s { thing.Ready -> s _ -> s }
+}
+`,
+  );
+}
+
+test("Gleam imports resolve to in-repo modules and leave the stdlib a string", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "graft-gleam-imports-"));
+  try {
+    gleamPackage(dir);
+    const built = await buildGraph(dir, { reuse: false });
+    const g = readGraph(wiringPath(built.contextDir));
+    const imports = (g?.edges ?? []).filter((e) => e.relation === "imports" && e.source === "src/app.gleam");
+    assert.deepEqual([...new Set(imports.map((e) => e.target))].sort(), ["gleam/list", "src/app/thing.gleam"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a Gleam qualified call resolves through the import, never by bare name", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "graft-gleam-calls-"));
+  try {
+    gleamPackage(dir);
+    const built = await buildGraph(dir, { reuse: false });
+    const g = readGraph(wiringPath(built.contextDir));
+    const from = (g?.edges ?? []).filter((e) => e.source === "src/app.gleam#run");
+
+    // `list.map` is gleam/list's — NOT the same-named function next door. This is
+    // the whole point of routing qualified calls through the import table.
+    assert.equal(from.find((e) => e.target === "src/mine.gleam#map"), undefined);
+
+    // Both the qualified `thing.helper(1)` and the unqualified-import `helper(2)`
+    // name the same module, so both land on that module's definition.
+    assert.ok(from.some((e) => e.relation === "calls" && e.target === "src/app/thing.gleam#helper"));
+
+    // Construction and destructuring reach a remote constructor.
+    assert.ok(from.some((e) => e.relation === "calls" && e.target === "src/app/thing.gleam#Busy"));
+    assert.ok(from.some((e) => e.relation === "calls" && e.target === "src/app/thing.gleam#Ready"));
+
+    // A type and its constructor share the name `Cfg`; the use site picks which.
+    const cfg = g?.nodes.find((n) => n.name === "Cfg" && n.kind === "type");
+    const ctor = g?.nodes.find((n) => n.name === "Cfg" && n.kind === "function");
+    assert.ok(cfg && ctor && cfg.id !== ctor.id, "both a Cfg type and a Cfg constructor exist");
+    assert.ok(from.some((e) => e.relation === "references" && e.target === cfg.id), "`c: thing.Cfg` → the type");
+    assert.ok(from.some((e) => e.relation === "calls" && e.target === ctor.id), "`thing.Cfg(a: 2)` → the constructor");
+
+    // A type used only in an annotation is not an orphan.
+    assert.ok(from.some((e) => e.relation === "references" && e.target === "src/app/thing.gleam#State"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a Gleam call with no import to back it is dropped, not guessed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "graft-gleam-drop-"));
+  try {
+    mkdirSync(join(dir, "src"), { recursive: true });
+    writeFileSync(join(dir, "src", "util.gleam"), `pub fn run(x: Int) -> Int { x }\n`);
+    // `cfg.run()` is a record field holding a function — `cfg` is a local, not a
+    // module, so there is nothing to scope the name to and no edge to be had.
+    writeFileSync(
+      join(dir, "src", "app.gleam"),
+      `pub fn go(cfg) {\n  cfg.run(1)\n}\n`,
+    );
+    const built = await buildGraph(dir, { reuse: false });
+    const g = readGraph(wiringPath(built.contextDir));
+    assert.equal((g?.edges ?? []).find((e) => e.source === "src/app.gleam#go"), undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a Gleam function that is piped into or passed as a value is not an orphan", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "graft-gleam-values-"));
+  try {
+    mkdirSync(join(dir, "src", "app"), { recursive: true });
+    writeFileSync(
+      join(dir, "src", "app", "thing.gleam"),
+      `pub const limit = 3
+
+pub fn piped(n: Int) -> Int { n }
+
+pub fn handed(n: Int) -> Int { n }
+
+pub fn name(n: Int) -> Int { n }
+`,
+    );
+    writeFileSync(
+      join(dir, "src", "app.gleam"),
+      `import gleam/list
+import app/thing
+
+pub fn local(n: Int) -> Int { n }
+
+pub fn run(xs: List(Int), cb) {
+  let n = 1 |> thing.piped |> local |> cb
+  list.map(xs, thing.handed)
+  list.map(xs, local)
+  list.map(xs, cb)
+  n + thing.limit
+}
+
+pub fn show(thing) { thing.name }
+
+pub fn apply(thing) { thing.piped(thing) }
+
+pub type Shape { Shape(local: Int) }
+
+pub fn unwrap(s: Shape) {
+  let Shape(local:) = s
+  list.map([1], fn(_) { local })
+  [local]
+}
+`,
+    );
+    const built = await buildGraph(dir, { reuse: false });
+    const g = readGraph(wiringPath(built.contextDir));
+    const from = (id: string) => (g?.edges ?? []).filter((e) => e.source === id).map((e) => `${e.relation} ${e.target}`);
+    const run = from("src/app.gleam#run");
+
+    // The right of a pipe is applied, parentheses or not.
+    assert.ok(run.includes("calls src/app/thing.gleam#piped"));
+    assert.ok(run.includes("calls src/app.gleam#local"));
+
+    // A callback is named, not called — and so is a constant.
+    assert.ok(run.includes("references src/app/thing.gleam#handed"));
+    assert.ok(run.includes("references src/app.gleam#local"));
+    assert.ok(run.includes("references src/app/thing.gleam#limit"));
+
+    // `cb` is a parameter: nothing to point at, piped or passed.
+    assert.equal(run.find((e) => e.endsWith("#cb") || e.endsWith(" cb")), undefined);
+
+    // In `show` and `apply`, `thing` is a parameter that shadows the import. Read
+    // as a value, `thing.name` is a record field — not app/thing's `name`. Applied,
+    // `thing.piped(thing)` is the module's function, which is what Gleam falls
+    // back to when the record has no such field.
+    assert.deepEqual(from("src/app.gleam#show"), []);
+    assert.deepEqual(from("src/app.gleam#apply"), ["calls src/app/thing.gleam#piped"]);
+
+    // `Shape(local:)` binds `local` by label shorthand, so `[local]` is that
+    // value — not this file's `local` function.
+    assert.equal(from("src/app.gleam#unwrap").find((e) => e.endsWith("#local")), undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a bare Gleam name never resolves outside its own file and imports", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "graft-gleam-bare-"));
+  try {
+    mkdirSync(join(dir, "src"), { recursive: true });
+    // The only `commands` function and `State` type in the repo — exactly what a
+    // repo-wide bare-name lookup would settle on.
+    writeFileSync(join(dir, "src", "other.gleam"), `pub type State { State }\n\npub fn commands(x) { x }\n`);
+    // Here `commands` is a parameter being called and `State` is not imported.
+    writeFileSync(
+      join(dir, "src", "app.gleam"),
+      `pub fn local(x) { x }\n\npub fn run(commands, s: State) {\n  commands(1)\n  local(s)\n}\n`,
+    );
+    const built = await buildGraph(dir, { reuse: false });
+    const g = readGraph(wiringPath(built.contextDir));
+    const from = (g?.edges ?? []).filter((e) => e.source === "src/app.gleam#run").map((e) => `${e.relation} ${e.target}`);
+    assert.deepEqual(from, ["calls src/app.gleam#local"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a Gleam file's own names resolve even when a nested package repeats its path", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "graft-gleam-nested-"));
+  try {
+    const src = `pub fn helper() { 1 }\n\npub fn run() { helper() }\n`;
+    for (const root of [dir, join(dir, "packages", "inner")]) {
+      mkdirSync(join(root, "src"), { recursive: true });
+      writeFileSync(join(root, "src", "app.gleam"), src);
+    }
+    const built = await buildGraph(dir, { reuse: false });
+    const g = readGraph(wiringPath(built.contextDir));
+    const calls = (g?.edges ?? []).filter((e) => e.relation === "calls").map((e) => `${e.source} -> ${e.target}`).sort();
+    assert.deepEqual(calls, [
+      "packages/inner/src/app.gleam#run -> packages/inner/src/app.gleam#helper",
+      "src/app.gleam#run -> src/app.gleam#helper",
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Gleam's newer syntax (echo, assert messages) parses without losing the surrounding calls", async () => {
+  await warmGenericGrammars(["gleam"]);
+  const src = `import app/thing
+
+pub fn run(x) {
+  let assert Ok(y) = thing.helper(x) as "must work"
+  echo y
+  echo y as "label"
+  y
+}
+`;
+  const { nodes, rawEdges } = extractGeneric("src/app.gleam", src, "gleam");
+  assert.ok(nodes.some((n) => n.kind === "function" && n.name === "run"));
+  assert.ok(
+    rawEdges.some((e) => e.source === "src/app.gleam#run" && e.name === "helper" && e.specifier === "app/thing"),
+    "the qualified call survives an `as` message and `echo` lines after it",
+  );
+});
 
 // Structural references the grammar already marks — a supertype (extends), an
 // implemented interface, an object creation — become `references` edges the resolver
@@ -235,43 +565,6 @@ test("breadth tier: Rust use crate::… resolves to the in-repo module (longest-
   assert.deepEqual(fromTest.map((e) => e.target), ["crate::error::Error"], "test-binary crate:: never resolves into the lib");
 });
 
-// PHP `use App\Models\User` → a file→class-file import, resolved to the in-repo class by
-// the longest namespace-tail suffix (PSR-4 root is unknown). Groups expand; `use function`
-// is skipped; a vendor/unknown class or an ambiguous tail stays a string, never guessed.
-test("breadth tier: PHP use resolves to the class file (namespace-suffix, groups, drop-rather-than-guess)", async () => {
-  await warmGenericGrammars(["php"]);
-  const files: Record<string, string> = {
-    "src/Models/User.php": "<?php\nnamespace App\\Models;\nclass User {}\n",
-    "src/Http/Request.php": "<?php\nnamespace App\\Http;\nclass Request {}\n",
-    "src/Http/Response.php": "<?php\nnamespace App\\Http;\nclass Response {}\n",
-    "a/Dup.php": "<?php\nclass Dup {}\n",
-    "b/Dup.php": "<?php\nclass Dup {}\n",
-    "src/App.php":
-      "<?php\nnamespace App;\n" +
-      "use App\\Models\\User;\n" +              // → src/Models/User.php
-      "use App\\Http\\{Request, Response};\n" +  // group → both Http files
-      "use App\\Support\\Str as S;\n" +          // in-namespace but no file → string
-      "use function App\\helpers\\tap;\n" +      // function import → skipped, no edge
-      "use Psr\\Log\\LoggerInterface;\n" +       // external vendor → string
-      "use Whatever\\Dup;\n" +                   // ambiguous basename → drop
-      "class App {}\n",
-  };
-  const nodes = [], raw = [];
-  for (const [rel, src] of Object.entries(files)) {
-    const r = extractGeneric(rel, src, "php");
-    nodes.push(...r.nodes); raw.push(...r.rawEdges);
-  }
-  const imports = resolveEdges(nodes, raw).filter((e) => e.relation === "imports" && e.source === "src/App.php");
-  const targets = imports.map((e) => e.target).sort();
-
-  assert.ok(targets.includes("src/Models/User.php"), "use App\\Models\\User → Models/User.php");
-  assert.ok(targets.includes("src/Http/Request.php") && targets.includes("src/Http/Response.php"), "group expands to both");
-  assert.ok(targets.includes("App\\Support\\Str"), "in-namespace but fileless → kept as string");
-  assert.ok(targets.includes("Psr\\Log\\LoggerInterface"), "external vendor class → kept as string");
-  assert.ok(targets.includes("Whatever\\Dup"), "ambiguous basename → kept as string, never guessed");
-  assert.ok(!targets.some((t) => /tap|helpers/.test(t)), "use function … is skipped (symbol import, not a class file)");
-});
-
 test("buildGraph + checkGraph handle a breadth-tier (.rs) repo end-to-end", async () => {
   const dir = mkdtempSync(join(tmpdir(), "graft-rust-"));
   mkdirSync(join(dir, "src"), { recursive: true });
@@ -289,4 +582,244 @@ test("buildGraph + checkGraph handle a breadth-tier (.rs) repo end-to-end", asyn
   // identically, so a fresh graph reads as in-sync, not perpetually stale.
   const chk = await checkGraph(dir);
   assert.equal(chk.ok, true, `check OK on a breadth-tier repo (added=${chk.added}, removed=${chk.removed})`);
+});
+
+// #134: Dart is a breadth-tier language with no vendored tags.scm, so the
+// node-kind walker minted class_body / locals and skipped top-level functions.
+// Issue fixture — top-level const + functions + a method that calls a top-level fn.
+const DART = `const int kThreshold = 3;
+
+bool isReady(int count) => count >= kThreshold;
+
+String describe(int count) {
+  final label = isReady(count) ? 'ready' : 'waiting';
+  return label;
+}
+
+class Counter {
+  int value = 0;
+
+  bool ready() => isReady(value);
+}
+`;
+
+test("genericLangOf routes .dart to the breadth tier", () => {
+  assert.equal(genericLangOf("lib/example.dart")?.name, "dart");
+});
+
+test("Dart top-level functions/consts become symbols; call edges resolve; body locals stay out (#134)", async () => {
+  await warmGenericGrammars(["dart"]);
+  assert.ok(isWarm("dart"), "dart grammar should warm");
+  const { nodes, rawEdges } = extractGeneric("lib/example.dart", DART, "dart");
+  const symbols = nodes.filter((n) => n.kind !== "file");
+  const byName = new Map(symbols.map((n) => [n.name, n]));
+
+  assert.equal(byName.get("isReady")?.kind, "function", "isReady is a top-level function");
+  assert.equal(byName.get("describe")?.kind, "function", "describe is a top-level function");
+  assert.equal(byName.get("kThreshold")?.kind, "constant", "kThreshold is a top-level const");
+  assert.equal(byName.get("Counter")?.kind, "class");
+  assert.equal(byName.get("ready")?.kind, "method", "Counter.ready is a method");
+
+  assert.ok(!symbols.some((n) => n.name === "label"), "function-body local `label` is not a symbol");
+  assert.ok(
+    !symbols.some((n) => n.kind === "class" && n.name === "int"),
+    `no bogus class int (got ${symbols.filter((n) => n.kind === "class").map((n) => n.name).join(", ")})`,
+  );
+
+  const edges = resolveEdges(nodes, rawEdges);
+  const calls = edges
+    .filter((e) => e.relation === "calls")
+    .map((e) => `${e.source.split("#")[1]}→${e.target.split("#")[1]}`);
+  assert.ok(calls.includes("describe→isReady"), `describe → isReady (got ${calls.join(", ")})`);
+  assert.ok(calls.includes("ready→isReady"), `Counter.ready → isReady (got ${calls.join(", ")})`);
+});
+
+test("Dart file-level skeleton lists the API, not function-body locals (#134)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "graft-dart-"));
+  mkdirSync(join(dir, "lib"));
+  writeFileSync(join(dir, "lib", "example.dart"), DART);
+
+  await buildGraph(dir, { reuse: false });
+  const r = skeleton(dir, "lib/example.dart");
+  const names = r.entries.map((e) => e.name);
+  for (const want of ["isReady", "describe", "kThreshold", "Counter", "ready"]) {
+    assert.ok(names.includes(want), `skeleton includes ${want} (got ${names.join(", ")})`);
+  }
+  assert.ok(!names.includes("label"), "skeleton omits function-body local `label`");
+  assert.ok(
+    !r.entries.some((e) => e.kind === "class" && e.name === "int"),
+    "skeleton has no bogus class int",
+  );
+});
+
+// #293 remainder: .glsl is in tree-sitter-wasm; no tags.scm, so the walker
+// fallback must still mint struct/function symbols so skeleton is not empty.
+// .gd is #299 — do not register gdscript here.
+const GLSL = `struct Probe {
+  vec3 origin;
+  float radius;
+};
+
+float march(vec3 p) {
+  return length(p);
+}
+
+void main() {
+  float d = march(vec3(0.0));
+}
+`;
+
+test("genericLangOf routes .glsl to the breadth tier (#293)", () => {
+  assert.equal(genericLangOf("shaders/cell.glsl")?.name, "glsl");
+});
+
+test("GLSL struct and functions become symbols without a tags query (#293)", async () => {
+  await warmGenericGrammars(["glsl"]);
+  assert.ok(isWarm("glsl"), "glsl grammar should warm");
+  const { nodes, rawEdges } = extractGeneric("shaders/cell.glsl", GLSL, "glsl");
+  const symbols = nodes.filter((n) => n.kind !== "file");
+  const byName = new Map(symbols.map((n) => [n.name, n]));
+
+  assert.equal(byName.get("Probe")?.kind, "struct", "Probe is a struct");
+  assert.equal(byName.get("march")?.kind, "function", "march is a function");
+  assert.equal(byName.get("main")?.kind, "function", "main is a function");
+  assert.equal(rawEdges.length, 0, "no tags.scm → symbols only, no call edges");
+});
+
+test("GLSL file-level skeleton lists the shader API (#293)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "graft-glsl-"));
+  mkdirSync(join(dir, "shaders"));
+  writeFileSync(join(dir, "shaders", "cell.glsl"), GLSL);
+
+  await buildGraph(dir, { reuse: false });
+  const r = skeleton(dir, "shaders/cell.glsl");
+  const names = r.entries.map((e) => e.name);
+  for (const want of ["Probe", "march", "main"]) {
+    assert.ok(names.includes(want), `skeleton includes ${want} (got ${names.join(", ")})`);
+  }
+});
+
+// #139: tree-sitter-wasm 1.1.4's PHP grammar throws `memory access out of bounds`
+// on heredoc/nowdoc, and extractGeneric swallows that into a file-only result.
+// PHP is depth-tier now (.php is not claimed by the breadth registry), so this
+// loads the wasm grammar directly — the same parse the breadth path used when
+// the issue landed.
+// v1.1.6 is the first release that parses these without crashing.
+const PHP_HEREDOC = `<?php
+namespace App;
+class WithHeredoc {
+    public function sql(): string {
+        return <<<SQL
+            SELECT 1
+            SQL;
+    }
+    public function other(): int { return 2; }
+}
+`;
+
+const PHP_NOWDOC = `<?php
+namespace App;
+class WithNowdoc {
+    public function sql(): string {
+        return <<<'SQL'
+            SELECT 1
+            SQL;
+    }
+    public function other(): int { return 2; }
+}
+`;
+
+function namedOfType(root: TsNode, type: string): string[] {
+  const names: string[] = [];
+  const visit = (n: TsNode): void => {
+    if (n.type === type) {
+      const name = n.childForFieldName?.("name")?.text;
+      if (name) names.push(name);
+    }
+    for (let i = 0; i < (n.namedChildCount ?? 0); i++) {
+      const c = n.namedChild?.(i);
+      if (c) visit(c);
+    }
+  };
+  visit(root);
+  return names;
+}
+
+async function assertPhpWasmExtractsClassAndMethods(source: string, className: string, label: string): Promise<void> {
+  const language = await loadWasmLanguage("php");
+  assert.ok(language, "tree-sitter-wasm must ship a php grammar");
+  const root = parseWasm(language, source);
+  assert.ok(root, `${label}: PHP wasm parse must not crash (1.1.4 threw on heredoc/nowdoc)`);
+  const classes = namedOfType(root, "class_declaration");
+  const methods = namedOfType(root, "method_declaration");
+  assert.ok(classes.includes(className), `${label}: expected class ${className}, got: ${classes.join(", ") || "(none)"}`);
+  assert.ok(methods.includes("sql"), `${label}: expected method sql, got: ${methods.join(", ") || "(none)"}`);
+  assert.ok(methods.includes("other"), `${label}: expected method other, got: ${methods.join(", ") || "(none)"}`);
+}
+
+test("PHP wasm grammar extracts class + methods from a heredoc file (#139)", async () => {
+  await assertPhpWasmExtractsClassAndMethods(PHP_HEREDOC, "WithHeredoc", "heredoc");
+});
+
+test("PHP wasm grammar extracts class + methods from a nowdoc file (#139)", async () => {
+  await assertPhpWasmExtractsClassAndMethods(PHP_NOWDOC, "WithNowdoc", "nowdoc");
+});
+
+/**
+ * A grammar whose parse throws (the tree-sitter-wasm PHP grammar did, on
+ * heredocs — #139) must surface as a per-file build error, not be swallowed
+ * into a silently symbol-less file that the extract cache then replays as a
+ * clean parse. The real crash is heap-state dependent, so a deterministically
+ * throwing fake grammar is swapped in via the test seam instead.
+ */
+const THROWING_GRAMMAR = {
+  // web-tree-sitter's setLanguage() inspects the language object, so any
+  // property access blowing up makes extractGeneric's try block throw exactly
+  // like a crashing wasm scanner does.
+  language: new Proxy({}, { get(): never { throw new Error("memory access out of bounds (fake)"); } }),
+  query: null,
+};
+
+test("extractGeneric rethrows a throwing grammar with the language named (#139)", async () => {
+  await warmGenericGrammars(["rust"]); // initialises web-tree-sitter
+  const prev = swapGrammarForTest("rust", THROWING_GRAMMAR);
+  try {
+    assert.throws(
+      () => extractGeneric("src/lib.rs", "pub fn f() {}\n", "rust"),
+      (err: unknown): boolean => {
+        assert.ok(err instanceof Error, "throws an Error");
+        assert.match(err.message, /^rust grammar threw: /, "names the language");
+        assert.match(err.message, /memory access out of bounds/, "keeps the original message");
+        return true;
+      },
+    );
+  } finally {
+    swapGrammarForTest("rust", prev);
+  }
+});
+
+test("a throwing grammar is a per-file build error, cached as a failure (#139)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "graft-throwing-grammar-"));
+  writeFileSync(join(dir, "lib.rs"), "pub fn f() {}\n");
+  await warmGenericGrammars(["rust"]); // so buildGraph's own warm call is a no-op
+  const prev = swapGrammarForTest("rust", THROWING_GRAMMAR);
+  try {
+    const first = await buildGraph(dir, { reuse: false });
+    assert.equal(first.errors.length, 1, `one build error (got: ${first.errors.join("; ")})`);
+    assert.match(first.errors[0], /lib\.rs: parse failed/);
+    assert.match(first.errors[0], /rust grammar threw: memory access out of bounds/);
+    const g = readGraph(wiringPath(contextDirFor(dir)));
+    assert.ok(g, "graph built");
+    assert.ok(!g!.nodes.some((n) => n.path === "lib.rs"), "failed file has no file node");
+
+    // The extract cache must remember the failure, not an empty success. An
+    // entry carrying an error is re-parsed rather than replayed (#312), so the
+    // still-throwing grammar reports the error again on the incremental rebuild.
+    const second = await buildGraph(dir, { reuse: true });
+    assert.equal(second.parsed, 1, "a cached failure is re-parsed, not replayed (#312)");
+    assert.equal(second.errors.length, 1, `error replayed (got: ${second.errors.join("; ")})`);
+    assert.match(second.errors[0], /rust grammar threw/);
+  } finally {
+    swapGrammarForTest("rust", prev);
+  }
 });

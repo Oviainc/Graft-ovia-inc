@@ -9,6 +9,7 @@ import {
   formatUpdateNudge,
   formatWiringRefresh,
   isNewer,
+  maybeRefreshInBackground,
   needsRefresh,
   readStamp,
   reconcileWiring,
@@ -49,7 +50,7 @@ test('formatUpdateNudge stays silent unless there is something to say', () => {
   const line = formatUpdateNudge('0.9.1', '0.11.0');
   assert.ok(line);
   assert.match(line, /0\.9\.1 → 0\.11\.0/);
-  assert.match(line, /npm i -g @nanonets\/graft@latest/);
+  assert.match(line, /run `graft upgrade`/);
   assert.equal(line.split('\n').length, 1, 'one line — this rides in an agent context window');
 });
 
@@ -67,6 +68,21 @@ test('the update cache is machine-global, not per-repo', () => {
   assert.equal(updateCachePath('/home/dev'), join('/home/dev', '.graft', 'update-check.json'));
 });
 
+test('DO_NOT_TRACK disables the automatic update check', () => {
+  const home = tmpRepo('upkeep-do-not-track');
+  const now = 1_700_000_000_000;
+
+  assert.equal(maybeRefreshInBackground(home, now, { DO_NOT_TRACK: '1' }), false);
+  assert.equal(existsSync(updateCachePath(home)), false, 'a disabled check leaves no attempt stamp');
+});
+
+test('an attempt stamp that cannot be saved starts no update check', () => {
+  const home = tmpRepo('upkeep-unwritable');
+  mkdirSync(updateCachePath(home), { recursive: true });
+
+  assert.equal(maybeRefreshInBackground(home, 1_700_000_000_000, {}), false);
+});
+
 test('runningVersion resolves this package, not the caller depth', () => {
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string };
   assert.equal(runningVersion(), pkg.version);
@@ -80,7 +96,7 @@ test('the stamp round-trips under graft/.cache/', () => {
   assert.deepEqual(readStamp(repo), {
     version: '1.2.3',
     hosts: ['claude', 'cursor'], // sorted, so two inits in different picker order match
-    opts: { global: true, mcp: true, hooks: true },
+    opts: { global: true, mcp: true, hooks: true, statusline: true },
     at: '2026-01-01T00:00:00.000Z',
   });
 });
@@ -92,7 +108,7 @@ test('wiringOpts defaults an older stamp to what plain `graft init` does', () =>
   // A partial record still fills the gaps.
   assert.deepEqual(
     wiringOpts({ version: '1.0.0', hosts: ['claude'], at: 'x', opts: { global: false } }),
-    { global: false, mcp: true, hooks: true },
+    { global: false, mcp: true, hooks: true, statusline: true },
   );
 });
 
@@ -105,9 +121,21 @@ test('a refresh replays the flags init was given, including --no-global', () => 
     rewrite: (_repo, _hosts, opts) => { seen = opts; },
   });
   // The user said "keep out of ~/.codex" — a later session must not overrule that.
-  assert.deepEqual(seen, { global: false, mcp: true, hooks: false });
+  assert.deepEqual(seen, { global: false, mcp: true, hooks: false, statusline: true });
   assert.equal(r?.global, false);
-  assert.deepEqual(readStamp(repo)?.opts, { global: false, mcp: true, hooks: false }, 'and it stays recorded');
+  assert.deepEqual(readStamp(repo)?.opts, { global: false, mcp: true, hooks: false, statusline: true }, 'and it stays recorded');
+});
+
+test('a refresh replays --no-statusline so a later session cannot re-install the bar', () => {
+  const repo = tmpRepo('upkeep-statusline');
+  writeStamp(repo, '1.0.0', ['claude'], { statusline: false });
+  let seen: WiringOpts | null = null;
+  reconcileWiring(repo, '2.0.0', {
+    wired: () => ['claude'],
+    rewrite: (_repo, _hosts, opts) => { seen = opts; },
+  });
+  assert.deepEqual(seen, { global: true, mcp: true, hooks: true, statusline: false });
+  assert.deepEqual(readStamp(repo)?.opts, { global: true, mcp: true, hooks: true, statusline: false });
 });
 
 test('by default a refresh DOES reach ~/.codex — nothing else ever would', () => {

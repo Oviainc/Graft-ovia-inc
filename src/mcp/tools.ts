@@ -3,7 +3,8 @@
  * `callTool` never throws — hosts get soft errors as isError content.
  */
 import { Graft } from '../engine.js';
-import { formatAsk, skeleton, formatSkeleton } from '../ask/ask.js';
+import { join } from 'node:path';
+import { formatAsk, formatAskWithSaved, skeleton, formatSkeleton } from '../ask/ask.js';
 import { formatCheckReport } from '../context/check.js';
 import { formatGraphCheckReport } from '../graph/check.js';
 import { loadGraphCached } from '../graph/load.js';
@@ -11,9 +12,11 @@ import { ensureFreshChildren, ensureFreshGraph, refreshNote } from '../graph/ref
 import { contextDirFor } from '../context/node-file.js';
 import { resolveSymbol, edgeWalk, type Direction, type EdgeHit } from '../graph/traverse.js';
 import { callersSavings, headerOf, hitLine, looseNoteFor } from '../graph/traverse-cli.js';
-import { withSavings } from '../context/savings.js';
+import { withSavings, setInputRate } from '../context/savings.js';
+import { sessionInputRate } from '../claude/session-metrics.js';
 import { grepGraph } from '../search/grep.js';
 import { formatGrepResult, zeroHitNote } from '../search/grep-cli.js';
+import { ignoredCode } from '../search/ignored-code.js';
 import { buildRepoMap, formatRepoMap } from '../graph/map.js';
 import {
   federateAsk,
@@ -24,6 +27,9 @@ import {
   readWorkspace,
 } from '../graph/workspace.js';
 import type { NodeV1 } from '../graph/types.js';
+import { recordLookup } from '../cloud/lookup-activity.js';
+import { canonicalToolName } from './tool-names.js';
+import { cmd } from '../brand.js';
 
 export interface ToolDef {
   name: string;
@@ -31,10 +37,10 @@ export interface ToolDef {
   inputSchema: object;
 }
 
-const NO_GRAPH = 'no graph found — run `graft build` first';
+const noGraph = (): string => `no graph found — run \`${cmd('graft build')}\` first`;
 
 function unknownSymbolText(query: string): string {
-  return `no symbol "${query}" in the graph — check spelling or run \`graft build\``;
+  return `no symbol "${query}" in the graph — check spelling or run \`${cmd('graft build')}\``;
 }
 
 export const TOOLS: ToolDef[] = [
@@ -200,30 +206,29 @@ async function callWorkspaceTool(
  * `graft_check_freshness` answer about a graph it just fixed, i.e. always "OK". */
 const NO_REFRESH_TOOLS = new Set(['graft_check_freshness']);
 
-/**
- * The pre-0.8.1 tool names, still accepted.
- *
- * The names were the reason for renaming: when a host defers graft's schemas it
- * shows the model the *names alone* — no descriptions — so `graft_ask` had to
- * compete with `Grep` on 9 characters of self-description. The new names say what
- * they do. But a name is an API: skills, saved prompts, scripts and other people's
- * notes reference the old ones, and silently 404-ing on them would be a worse
- * outcome than an ugly name. Not advertised in {@link TOOLS} — the roster stays six
- * — so this costs nothing in the payload and only ever rescues an old caller.
- */
-const TOOL_ALIASES: Record<string, string> = {
-  graft_ask: 'graft_find_code',
-  graft_grep: 'graft_find_all',
-  graft_callers: 'graft_trace_calls',
-  graft_skeleton: 'graft_file_api',
-  graft_map: 'graft_repo_map',
-  graft_check: 'graft_check_freshness',
-};
-
-/** Canonical name for a requested tool: itself, or what it was renamed to. */
-export function canonicalToolName(name: string): string {
-  return TOOL_ALIASES[name] ?? name;
+/** A clean graph may intentionally omit supported languages. Keep that scope
+ * visible on every answer, including zero hits, without changing unfiltered replies. */
+function extensionScopeNote(root: string, override?: string, children?: string[]): string | null {
+  const scopes = children
+    ? children.map((child) => ({ label: `${child}/: `, outDir: contextDirFor(join(root, child)) }))
+    : [{ label: '', outDir: contextDirFor(root, override) }];
+  const graphs = scopes.map((scope) => ({ ...scope, graph: loadGraphCached(scope.outDir) }));
+  if (!graphs.some(({ graph }) => graph?.meta?.extensions?.length)) return null;
+  const selections = graphs.map(({ label, graph }) =>
+    label + (graph?.meta?.extensions?.join(', ') || (graph ? 'all supported' : 'not built')));
+  return `Indexed extensions: ${selections.join('; ')}. Use ordinary source search for files outside these selections.`;
 }
+
+/**
+ * The pre-0.8.1 tool names, still accepted, live in the dependency-free
+ * `tool-names.ts` (shared with the engine-free session hooks). The names were the
+ * reason for renaming: when a host defers graft's schemas it shows the model the
+ * *names alone* — no descriptions — so `graft_ask` had to compete with `Grep` on
+ * 9 characters. The new names say what they do; the aliases keep old callers
+ * (skills, saved prompts, notes) from 404-ing. Re-exported here so existing
+ * importers of `canonicalToolName` from this module keep working.
+ */
+export { canonicalToolName };
 
 export async function callTool(
   root: string,
@@ -237,6 +242,9 @@ export async function callTool(
     // Freshness first: an answer that cites file:line has to be about the code as
     // it is right now, including edits nobody has committed (or even saved through
     // this agent). ~3ms when nothing moved; a structural, $0 rebuild when it did.
+    // Same reason as the CLI's `noteQuery`: price this session's tokens once,
+    // here, so the formatters downstream can put a dollar figure in the nudge.
+    setInputRate(sessionInputRate(root));
     let note: string | null = null;
     if (!NO_REFRESH_TOOLS.has(name)) {
       const r = ws
@@ -246,7 +254,8 @@ export async function callTool(
     }
     const fed = ws ? await callWorkspaceTool(root, dirOverride, name, args) : null;
     const res = fed ?? (await callSingleTool(root, name, args, dirOverride));
-    return note ? { ...res, text: `${note}\n${res.text}` } : res;
+    const notes = [note, extensionScopeNote(root, dirOverride, ws?.children)].filter(Boolean);
+    return notes.length ? { ...res, text: `${notes.join('\n')}\n${res.text}` } : res;
   } catch (err) {
     return { text: err instanceof Error ? err.message : String(err), isError: true };
   }
@@ -267,7 +276,11 @@ async function callSingleTool(
         const engine = new Graft({ contextDir: dirOverride });
         const inArg = typeof args.in === 'string' && args.in ? args.in : undefined;
         const r = engine.ask(root, query, { limit, source: true, full: args.full === true, in: inArg });
-        return { text: formatAsk(r), isError: false };
+        // Same event the CLI's `ask` reports: the learnings shown and the tokens saved.
+        // One render serves both the answer and the saving the event reports.
+        const { text, savedTokens } = formatAskWithSaved(r);
+        recordLookup(r, root, undefined, savedTokens);
+        return { text, isError: false };
       }
       case 'graft_file_api': {
         const file = String(args.file ?? '');
@@ -293,7 +306,7 @@ async function callSingleTool(
         const symbol = String(args.symbol ?? args.file ?? '');
         if (!symbol) return { text: 'graft_trace_calls requires a symbol', isError: true };
         const w = loadGraphCached(contextDirFor(root, dirOverride));
-        if (!w) return { text: NO_GRAPH, isError: true };
+        if (!w) return { text: noGraph(), isError: true };
         const inOpt = typeof args.in === 'string' && args.in ? { in: args.in } : {};
         const matches = resolveSymbol(w, symbol, inOpt);
         if (matches.length === 0) return { text: unknownSymbolText(symbol), isError: true };
@@ -316,18 +329,18 @@ async function callSingleTool(
         const pattern = String(args.pattern ?? '');
         if (!pattern) return { text: 'graft_find_all requires a pattern', isError: true };
         const w = loadGraphCached(contextDirFor(root, dirOverride));
-        if (!w) return { text: NO_GRAPH, isError: true };
+        if (!w) return { text: noGraph(), isError: true };
         const result = grepGraph(w, root, pattern, {
           ignoreCase: typeof args.ignore_case === 'boolean' ? args.ignore_case : undefined,
           fixed: typeof args.fixed === 'boolean' ? args.fixed : undefined,
           in: typeof args.in === 'string' && args.in ? args.in : undefined,
         });
-        if (result.totalHits === 0) return { text: zeroHitNote(result), isError: false };
+        if (result.totalHits === 0) return { text: zeroHitNote(result, ignoredCode(root)), isError: false };
         return { text: formatGrepResult(result), isError: false };
       }
       case 'graft_repo_map': {
         const w = loadGraphCached(contextDirFor(root, dirOverride));
-        if (!w) return { text: NO_GRAPH, isError: true };
+        if (!w) return { text: noGraph(), isError: true };
         const maxDirs = typeof args.max_dirs === 'number' && Number.isFinite(args.max_dirs) && args.max_dirs > 0 ? args.max_dirs : undefined;
         const map = buildRepoMap(w, { maxDirs });
         return { text: formatRepoMap(map), isError: false };

@@ -12,11 +12,13 @@
  * tool (`src/mcp/tools.ts`), so both surfaces render identical reports.
  */
 import { resolve } from "node:path";
+import { fileReader, referenceLine, wordRe } from "../blast/evidence.js";
 import { contextDirFor } from "../context/node-file.js";
 import { withSavings, savingsFor, type Savings } from "../context/savings.js";
 import { loadGraphCached } from "./load.js";
 import { resolveSymbol, edgeWalk, type Direction, type EdgeHit } from "./traverse.js";
 import type { GraphV1, NodeV1 } from "./types.js";
+import { cmd } from "../brand.js";
 
 export interface CallersCliOptions {
   in?: string;
@@ -40,12 +42,40 @@ export function headerOf(n: NodeV1): string {
 }
 
 /** `showDepth` is set for multi-hop walks (depth > 1), matching the old
- * `graft impact` output which tagged every hit with its BFS depth. */
-export function hitLine(direction: Direction, hit: EdgeHit, showDepth: boolean): string {
+ * `graft impact` output which tagged every hit with its BFS depth.
+ *
+ * `quote`, when given, is the call site itself — the line inside the hit where it
+ * references the symbol. An edge that says "total calls add" is a claim; the line
+ * under it is the evidence, and it saves opening the file to check.
+ */
+export function hitLine(direction: Direction, hit: EdgeHit, showDepth: boolean, quote?: Quote): string {
   const arrow = ARROW[direction];
   const depthTag = showDepth ? ` [depth ${hit.depth}]` : "";
   const label = hit.node ? `${hit.node.name} (${hit.node.path}:${hit.node.span})` : `${hit.id} (unresolved import)`;
-  return `  ${hit.relation} ${arrow} ${label}${depthTag}`;
+  const line = `  ${hit.relation} ${arrow} ${label}${depthTag}`;
+  return quote ? `${line}\n      ${quote.n}: ${quote.text.trim()}` : line;
+}
+
+/** A quoted source line: where the edge actually happens. */
+interface Quote {
+  n: number;
+  text: string;
+}
+
+/**
+ * The call site for one hit, or nothing.
+ *
+ * Only for a resolved hit whose span we can read: an unresolved import has no
+ * file, and a hit at depth 2+ references something in between rather than the
+ * symbol asked about, so quoting it would point at the wrong line.
+ */
+function quoteFor(
+  hit: EdgeHit,
+  name: string,
+  read: (path: string) => string[] | null,
+): Quote | undefined {
+  if (!hit.node || hit.depth > 1) return undefined;
+  return referenceLine(hit.node.path, hit.node.span, [wordRe(name)], read) ?? undefined;
 }
 
 /** Tokens-saved baseline for a callers/callees walk: the files of the matched
@@ -78,7 +108,7 @@ export function looseNoteFor(direction: Direction, name: string, candidateCount:
     candidateCount > 1
       ? ` ${candidateCount} definitions share the name "${name}"; a cross-file caller of an ambiguous name is dropped rather than guessed, so this may undercount.`
       : "";
-  return `  no indexed ${label} — the graph has no ${dir} call/reference edges for this symbol as written.${ambiguity} Check the name (try the bare symbol, or "Type.method"), or find its uses with graft grep "${name}". Fall back to raw grep -rn only for unindexed files`;
+  return `  no indexed ${label} — the graph has no ${dir} call/reference edges for this symbol as written.${ambiguity} Check the name (try the bare symbol, or "Type.method"), or find its uses with ${cmd("graft grep")} "${name}". Fall back to raw grep -rn only for unindexed files`;
 }
 
 interface SymbolJson {
@@ -139,7 +169,7 @@ export function runCallersCommand(query: string, dir: string, opts: CallersCliOp
   const contextDir = contextDirFor(root, opts.globalDir);
   const graph = loadGraphCached(contextDir);
   if (!graph) {
-    console.error(`✗ no graph found at ${contextDir} — run \`graft build\` first`);
+    console.error(`✗ no graph found at ${contextDir} — run \`${cmd("graft build")}\` first`);
     process.exit(1);
   }
 
@@ -155,7 +185,7 @@ export function runCallersCommand(query: string, dir: string, opts: CallersCliOp
     return;
   }
   if (matches.length === 0) {
-    console.error(`✗ no symbol "${query}" in the graph — check spelling or run graft build`);
+    console.error(`✗ no symbol "${query}" in the graph — check spelling or run ${cmd("graft build")}`);
     process.exit(1);
   }
 
@@ -200,10 +230,12 @@ export function runCallersCommand(query: string, dir: string, opts: CallersCliOp
   }
 
   const lines: string[] = [];
+  // One reader for the whole walk: several hits usually live in the same file.
+  const read = fileReader(root);
   for (const { symbol, hits } of results) {
     lines.push(headerOf(symbol));
     if (hits.length === 0) lines.push(looseNoteFor(direction, symbol.name, matches.length));
-    else for (const h of hits) lines.push(hitLine(direction, h, showDepth));
+    else for (const h of hits) lines.push(hitLine(direction, h, showDepth, quoteFor(h, symbol.name, read)));
     lines.push("");
   }
   const body = lines.join("\n").replace(/\n+$/, "\n");

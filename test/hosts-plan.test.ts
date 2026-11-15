@@ -35,12 +35,27 @@ test('planInit writes nothing — it only describes', () => {
   assert.deepEqual(readdirSync(repo), []);
 });
 
-test('claude writes are all repo-scoped — the claude layer never touches ~', () => {
+/**
+ * The claude layer used to be entirely repo-scoped. It no longer is, deliberately:
+ * a repo-only install is invisible to a `git worktree add` of a repo whose
+ * `.gitignore` covers `.mcp.json` / `.claude/settings.json`, and the user-level copy
+ * is the only place a `.gitignore` cannot reach. See src/hosts/claude-global.ts.
+ */
+test('claude writes: five in the repo, three in ~ that no .gitignore can eat', () => {
+  const home = fullHome();
   const repo = fresh();
-  const claude = planInit(repo, { home: fullHome(), ids: ['claude'] })[0];
-  assert.equal(claude.writes.length, 5);
-  assert.ok(claude.writes.every((w) => w.scope === 'repo'));
-  assert.ok(claude.writes.every((w) => w.path.startsWith(repo)));
+  const claude = planInit(repo, { home, ids: ['claude'] })[0];
+
+  const repoWrites = claude.writes.filter((w) => w.scope === 'repo');
+  assert.equal(repoWrites.length, 5);
+  assert.ok(repoWrites.every((w) => w.path.startsWith(repo)));
+
+  const globals = claude.writes.filter((w) => w.scope === 'global');
+  assert.deepEqual(
+    globals.map((w) => toPosixPath(w.path.slice(home.length))).sort(),
+    ['/.claude.json', '/.claude/helpers/graft-hooks.cjs', '/.claude/settings.json'],
+  );
+  assert.ok(globals.every((w) => !w.path.startsWith(repo)), 'nothing global lands in the repo');
 });
 
 test('the three ~/.codex writes are scoped global', () => {
@@ -99,4 +114,33 @@ test('selectedWrites filters to the chosen hosts only', () => {
   const plan = planInit(repo, { home: fullHome() });
   const writes = selectedWrites(plan, ['claude', 'adal']);
   assert.deepEqual([...new Set(writes.map((w) => w.hostId))].sort(), ['adal', 'claude']);
+});
+
+test('planInit honors --no-mcp / --no-hooks / --no-global like runHostsInit does (#329)', () => {
+  const repo = fresh(); const home = fullHome();
+  const byId = (plan: ReturnType<typeof planInit>, id: string) => plan.find((p) => p.id === id)!.writes;
+
+  const full = planInit(repo, { home });
+  assert.ok(byId(full, 'agents').some((w) => w.scope === 'global'), 'default plan lists the ~/.codex writes');
+  assert.ok(byId(full, 'cursor').some((w) => w.path.endsWith('hooks.json')), 'default plan lists the Cursor hooks');
+
+  const noMcp = planInit(repo, { home, mcp: false });
+  for (const p of noMcp) for (const w of p.writes) {
+    if (p.id === 'claude') continue;
+    assert.ok(!/mcp|config\.toml|settings\.json/.test(w.path) || w.path.endsWith('hooks.json'), `--no-mcp still plans ${w.path}`);
+  }
+
+  const noHooks = planInit(repo, { home, hooks: false });
+  assert.ok(!byId(noHooks, 'agents').some((w) => /hooks/.test(w.path)), '--no-hooks drops the Codex hooks');
+  assert.ok(!byId(noHooks, 'cursor').some((w) => w.path.endsWith('hooks.json')), '--no-hooks drops the Cursor hooks');
+
+  const noGlobal = planInit(repo, { home, global: false });
+  for (const p of noGlobal) for (const w of p.writes) {
+    assert.notEqual(w.scope, 'global', `--no-global still plans ${w.path}`);
+    assert.ok(!toPosixPath(w.path).startsWith(toPosixPath(home)), `--no-global still plans ${w.path} under ~`);
+  }
+  assert.ok(byId(noGlobal, 'cursor').some((w) => w.path.endsWith('hooks.json')), 'Cursor hooks are repo-local and survive --no-global');
+
+  const suppressed = planInit(repo, { home, mcp: false, hooks: false, global: false });
+  assert.deepEqual(byId(suppressed, 'agents').map((w) => toPosixPath(w.path)), [toPosixPath(join(repo, 'AGENTS.md'))]);
 });

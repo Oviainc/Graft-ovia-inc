@@ -8,7 +8,7 @@
  * timestamps, so rebuilding an unchanged repo produces a byte-identical file and
  * git diffs stay minimal.
  */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { EdgeV1, GraphV1, NodeV1 } from "./types.js";
 
@@ -33,6 +33,17 @@ export function readGraph(path: string): GraphV1 | null {
   }
 }
 
+/**
+ * JSON text with every non-ASCII character as a `\uXXXX` escape; JSON.parse reads
+ * back the same values. One non-ASCII character anywhere makes V8 hold a whole file,
+ * read back, as a two-byte string: on assign, ~100 MB more for each process that
+ * reads its 94 MB graph (every query, hook and build), and ~300 MB for the build's
+ * extract cache.
+ */
+export function asciiJson(json: string): string {
+  return json.replace(/[\u007f-\uffff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
 export function writeGraph(graph: GraphV1, outDir: string): string {
   const sorted: GraphV1 = {
     ...graph,
@@ -41,7 +52,28 @@ export function writeGraph(graph: GraphV1, outDir: string): string {
   };
   const path = wiringPath(outDir);
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(sorted, null, 2) + "\n");
+  // Atomic write (temp + rename): the crux pass now checkpoints wiring.json
+  // periodically (#128), and a --deep run is exactly what gets killed mid-flush
+  // (SIGTERM/CI timeout/laptop sleep). A partial writeFileSync would leave a
+  // truncated, unparseable graph; rename swaps it in atomically on the same fs.
+  //
+  // pid in the temp name, and removed when the write fails — the same discipline
+  // `writeJsonAtomic` (util/state.ts) documents: a fixed name lets a concurrent
+  // build (a manual `graft build` racing the refresh child) write the same scratch
+  // file and hand the loser a corrupt graph, and a failed rename would otherwise
+  // leave a full-size orphan behind that nothing ever cleans up.
+  const tmp = `${path}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, asciiJson(JSON.stringify(sorted, null, 2)) + "\n");
+    renameSync(tmp, path);
+  } catch (e) {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      /* nothing more we can do */
+    }
+    throw e;
+  }
   return path;
 }
 

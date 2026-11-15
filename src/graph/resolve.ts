@@ -15,11 +15,103 @@
 import { posix } from "node:path";
 import { toPosixPath } from "../util/paths.js";
 import type { EdgeV1, Kind, NodeV1, Relation } from "./types.js";
-import type { RawEdge } from "./extract.js";
+import { languageOf, type RawEdge } from "./extract.js";
+import { genericLangOf } from "./generic.js";
 
 const IMPORT_EXTS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".py"];
 /** C/C++ source + header extensions, for resolving `#include` targets. */
 const C_EXT = /\.(c|h|cc|cpp|cxx|hpp|hh|hxx|inl|ipp|c\+\+|h\+\+)$/i;
+/** Python source + stub extensions, for the constructor-call fallback below. */
+const PY_EXT = /\.pyi?$/i;
+/** What a bare Python call falls back to when no function of that name exists:
+ * construction. Only `class` — Python enums, dataclasses and NamedTuples are all
+ * classes, so no other kind is reachable this way. */
+const PY_CTOR_KINDS: Kind[] = ["class"];
+/** Swift is Python's case with more nominal kinds: `Animal(legs: 4)` is an ordinary
+ * call node with no `new` to mark construction, and struct/enum initializers are as
+ * routine as class ones (a struct gets a memberwise init for free). Same fallback
+ * shape — types are tried only once functions (and methods, see extract.ts's
+ * implicit-self widening) have found nothing. */
+const SWIFT_EXT = /\.swift$/i;
+const EX_EXT = /\.exs?$/i;
+const SWIFT_CTOR_KINDS: Kind[] = ["class", "struct", "enum"];
+/** Kotlin is Swift's case again — `Mailer(host = "smtp")` is an ordinary call node with
+ * no `new` to mark it — and it has free functions too, so it takes the same fallback
+ * rather than Java's outright widening. Without it a DI-heavy backend loses most of its
+ * coupling: measured on a 717-file Kotlin monorepo (#387), a service class constructed in
+ * a Koin module and instantiated five times in its integration test reported `no indexed
+ * callers`, while the free functions in the same package resolved 51 call sites.
+ *
+ * `class` alone, unlike Swift's three kinds. `data class`, `object` and `companion
+ * object` are that kind already (see extract.ts's KOTLIN_KINDS and describeKotlin), so it
+ * covers construction. The two kinds left out are left out on measured grounds, not
+ * because the language forbids them:
+ *   - `enum`: an enum class's constructor IS private in Kotlin, so `Color(…)` cannot be
+ *     written from outside — this one really is unreachable.
+ *   - `interface`: this one is reachable in principle. A `fun interface` is SAM-converted
+ *     by writing `Action { … }`, which is an ordinary `call_expression`, and since Kotlin
+ *     1.6 an `annotation class` (also kind "interface" here) can be instantiated. It is
+ *     excluded because tree-sitter-kotlin@0.3.8 cannot parse `fun interface` at all — it
+ *     yields an ERROR node, so no such interface becomes a node to resolve against — and
+ *     admitting the kind today would widen what an unresolvable bare call can land on
+ *     while buying nothing. Worth revisiting if that grammar gap closes.
+ *
+ * And this is a fallback, so it inherits the fallback's imprecision honestly: `class` also
+ * covers `object`, where `Factory()` may be an `operator fun invoke` rather than a
+ * constructor, and a local `val Mailer = factory; Mailer()` shadows the type it names.
+ * Python and Swift already make that trade above; this one is no tighter. What keeps it
+ * safe is the ordering — a real function of that name resolves first — and resolveName's
+ * unique-match rule, which drops the ambiguous rather than picking. */
+const KOTLIN_EXT = /\.kts?$/i;
+const KOTLIN_CTOR_KINDS: Kind[] = ["class"];
+
+/**
+ * Languages whose symbols can genuinely reach each other. A call edge may not
+ * cross a family boundary.
+ *
+ * This exists because name resolution is repo-wide and used to be language-blind.
+ * A Go file calling the builtin `make(...)` has nothing in the repo to resolve
+ * against, so the unique-global fallback below matched a TypeScript helper named
+ * `make` in a frontend test file — and then every `make(map[...])` in the backend
+ * became an edge into that file. One symbol collected 1040 in-edges across 476
+ * files, and any pull request touching that test dragged the entire Go backend
+ * into its blast radius. Uniqueness is what made it fire: the rarer the collision,
+ * the more confident the old code was that it had found the right target.
+ *
+ * Only real interop is grouped here. TS/TSX/JS import each other freely; Kotlin,
+ * Scala and Clojure compile against Java on one classpath; C and C++ share
+ * headers. Everything else stands alone.
+ */
+const FAMILIES: ReadonlyArray<readonly string[]> = [
+  ["typescript", "tsx"],
+  ["java", "kotlin", "scala", "clojure"],
+  ["c", "cpp"],
+];
+const FAMILY_OF = new Map<string, string>();
+for (const group of FAMILIES) for (const lang of group) FAMILY_OF.set(lang, group[0]);
+
+/**
+ * The language family a path belongs to, or null when no tier claims the file.
+ * A language of its own is its own family, so the common case needs no entry above.
+ */
+function familyOf(path: string): string | null {
+  const lang = languageOf(path) ?? genericLangOf(path)?.name ?? null;
+  if (!lang) return null;
+  return FAMILY_OF.get(lang) ?? lang;
+}
+
+/**
+ * Could a reference in `file` reach a definition in `candidatePath`?
+ *
+ * An unknown family never filters: absence of data is not evidence of a mismatch,
+ * and refusing edges for every extension graft cannot name would lose real ones.
+ */
+function reachable(file: string, candidatePath: string): boolean {
+  const from = familyOf(file);
+  if (from === null) return true;
+  const to = familyOf(candidatePath);
+  return to === null || from === to;
+}
 
 /** A Go module discovered in the repo: its `module` path from `go.mod` and the repo
  * directory that `go.mod` lives in (posix, `.` for the repo root). A monorepo may hold
@@ -66,6 +158,10 @@ export function resolveEdges(
   // node ids. A `use App\Models\User` names a PSR-4 class whose file mirrors the namespace
   // tail under some (unknown) source root, so the suffix is the portable key.
   const phpFilesBySuffix = new Map<string, string[]>();
+  // Gleam module resolution: a file's path-suffix (`app/thing.gleam`) → its file
+  // node ids. A Gleam package roots every module at its own `src/` (or `test/`),
+  // so an `import app/thing` is exactly that suffix under some unknown root.
+  const gleamFilesBySuffix = new Map<string, string[]>();
   const hasGoModules = !!opts.goModules?.length;
   for (const n of nodes) {
     if (n.kind === "file") {
@@ -88,6 +184,10 @@ export function resolveEdges(
         const parts = toPosixPath(n.path).split("/");
         for (let i = 0; i < parts.length; i++) push(phpFilesBySuffix, parts.slice(i).join("/"), n.id);
       }
+      if (n.path.endsWith(".gleam")) {
+        const parts = toPosixPath(n.path).split("/");
+        for (let i = 0; i < parts.length; i++) push(gleamFilesBySuffix, parts.slice(i).join("/"), n.id);
+      }
       {
         const p = toPosixPath(n.path);
         if (p === "lib.rs" || p === "main.rs") rustCrateRoots.push("");
@@ -99,14 +199,24 @@ export function resolveEdges(
     let fileMap = perFileName.get(n.path);
     if (!fileMap) perFileName.set(n.path, (fileMap = new Map()));
     push(fileMap, n.name, n);
-    if (n.kind === "method" && n.owner) {
-      push(ownerMethod, `${n.owner}.${n.name}`, n);
+    // Elixir functions carry `owner` (their module) from extractElixir and are looked up
+    // the same owner-qualified way a method is.
+    if (n.kind === "method" || (n.kind === "function" && n.owner)) {
+      const owner = n.owner ?? ownerFromMethodId(n.id);
+      if (owner) push(ownerMethod, `${owner}.${n.name}`, n);
     }
   }
 
   // classParents: class/interface name → its declared base-class names, from raw
   // `extends` edges (source id's own name → the base name). Used to walk up an
   // inheritance chain when a receiver's own type has no matching method.
+  // Elixir module nodes by full name (extractElixir stamps `fqn`; a nested module's
+  // `name` is the bare last segment).
+  const moduleByFqn = new Map<string, NodeV1>();
+  for (const n of nodes) {
+    if (n.kind === "module" && n.fqn && !moduleByFqn.has(n.fqn)) moduleByFqn.set(n.fqn, n);
+  }
+
   const classParents = new Map<string, string[]>();
   for (const e of rawEdges) {
     if (e.relation !== "extends" || !e.name) continue;
@@ -116,6 +226,17 @@ export function resolveEdges(
     const ownName = byId.get(e.source)?.name;
     if (!ownName) continue;
     push(classParents, ownName, e.name);
+  }
+
+  // classTraits: class name → trait names from raw `implements` edges in PHP files.
+  // PHP models `use SomeTrait;` as implements; trait methods live on the trait owner,
+  // not the using class, so resolveTypedMember walks these after the class lookup fails.
+  const classTraits = new Map<string, string[]>();
+  for (const e of rawEdges) {
+    if (e.relation !== "implements" || !e.name || !e.file.endsWith(".php")) continue;
+    const ownName = byId.get(e.source)?.name;
+    if (!ownName) continue;
+    push(classTraits, ownName, e.name);
   }
 
   const out: EdgeV1[] = [];
@@ -142,10 +263,14 @@ export function resolveEdges(
                 ? resolveRustUse(e.specifier, e.file, byId, rustCrateRoots)
                 : e.file.endsWith(".php")
                   ? resolvePhpUse(e.specifier, phpFilesBySuffix)
-                  : resolveImport(e.specifier, e.file, byId);
+                  : e.file.endsWith(".gleam")
+                    ? resolveGleamImport(e.specifier, gleamFilesBySuffix)
+                    : resolveImport(e.specifier, e.file, byId);
       add(e.source, target, "imports", "extracted");
     } else if (e.relation === "extends" || e.relation === "implements") {
-      const kinds: Kind[] = e.relation === "implements" ? ["interface"] : ["class", "interface"];
+      // `implements` also resolves to a `trait` — PHP models trait composition
+      // (`use SomeTrait;`) as an implements edge, and a trait is a valid target.
+      const kinds: Kind[] = e.relation === "implements" ? ["interface", "trait"] : ["class", "interface"];
       const hit = resolveName(e.name!, e.file, kinds, perFileName, globalName);
       // an unresolved base is usually an external/imported type — keep the name.
       add(e.source, hit?.id ?? e.name!, e.relation, hit?.confidence ?? "inferred");
@@ -154,10 +279,35 @@ export function resolveEdges(
         // A named import gives both halves needed for sound resolution: the module
         // it came from and the exported name. Resolve inside that file only, so a
         // same-named symbol elsewhere in the repo cannot become a false edge.
-        const targetFile = resolveImport(e.specifier, e.file, byId);
+        const targetFile = e.file.endsWith(".php")
+          ? resolvePhpUse(e.specifier, phpFilesBySuffix)
+          : e.file.endsWith(".gleam")
+            ? resolveGleamImport(e.specifier, gleamFilesBySuffix)
+            : resolveImport(e.specifier, e.file, byId);
         if (!byId.has(targetFile)) continue; // external or unresolved module
-        const candidates = perFileName.get(targetFile)?.get(e.name) ?? [];
+        const candidates = narrowGleamByKind(perFileName.get(targetFile)?.get(e.name) ?? [], e.file, TYPE_KINDS);
         if (candidates.length === 1) add(e.source, candidates[0].id, "references", "extracted");
+      } else if (e.file.endsWith(".php") && byId.get(e.source)?.origin === "ast") {
+        // PHP type/attribute without a `use` import (same-file or globally unique type).
+        const refKinds: Kind[] = ["class", "interface", "trait", "enum"];
+        const hit = resolveName(e.name, e.file, refKinds, perFileName, globalName);
+        if (hit && hit.id !== e.source) add(e.source, hit.id, "references", hit.confidence);
+      } else if (e.file.endsWith(".java") && byId.get(e.source)?.origin === "ast") {
+        // Java annotation without a specifier (same-file or globally unique
+        // `@interface`). Annotation types are `interface` kind — a class of the
+        // same name is not a match, so `@Entity` cannot collapse onto an in-repo
+        // `class Entity` (#103). Kind alone still cannot tell `@interface Service`
+        // from `interface Service`, so only accept a candidate whose header
+        // contains the literal `@interface` (`includes`, not `startsWith`: a
+        // meta-annotated type is `@Documented @Retention(...) public @interface
+        // JsonAdapter`). Unresolved targets keep the bare name, matching
+        // heritage, rather than dropping the way PHP attributes do.
+        const refKinds: Kind[] = ["interface"];
+        const hit = resolveName(e.name, e.file, refKinds, perFileName, globalName);
+        const anno = hit ? byId.get(hit.id) : undefined;
+        if (hit && hit.id !== e.source && anno?.signature?.includes("@interface"))
+          add(e.source, hit.id, "references", hit.confidence);
+        else add(e.source, e.name, "references", "inferred");
       } else if (byId.get(e.source)?.origin === "generic") {
         // Breadth tier: a bare-name structural reference (extends / implements /
         // object-creation / module alias) the grammar marked but cannot type. Resolve
@@ -169,17 +319,66 @@ export function resolveEdges(
         if (hit && hit.id !== e.source) add(e.source, hit.id, "references", hit.confidence);
       }
     } else if (e.relation === "calls") {
+      // Gleam (generic.ts's module pass): the call carries the module it targets —
+      // a qualified `list.map(…)` or a `{ … }`-imported bare name. That is both
+      // halves of a sound resolution, so look the name up in that module's file
+      // alone. A module that is not an in-repo file is the stdlib or a hex
+      // dependency: there is nothing to point at, and its labels (`map`, `try`,
+      // `new`) collide with in-repo names constantly, so the call drops.
+      if (e.specifier && e.file.endsWith(".gleam")) {
+        const targetFile = resolveGleamImport(e.specifier, gleamFilesBySuffix);
+        if (!byId.has(targetFile)) continue;
+        const candidates = narrowGleamByKind(perFileName.get(targetFile)?.get(e.name!) ?? [], e.file, CALLABLE_KINDS);
+        if (candidates.length === 1) add(e.source, candidates[0].id, "calls", "extracted");
+        continue;
+      }
+      if (e.specifier && e.file.endsWith(".go")) {
+        const dir = hasGoModules ? goImportDir(e.specifier, opts.goModules!) : null;
+        const candidates = (dir ? (goFilesByDir.get(dir) ?? []) : [])
+          .filter((f) => !f.endsWith("_test.go"))
+          .flatMap((f) => perFileName.get(f)?.get(e.name!) ?? [])
+          .filter((n) => n.kind === "function");
+        if (candidates.length === 1) add(e.source, candidates[0].id, "calls", "extracted");
+        continue;
+      }
       if (e.viaMember) {
         if (!e.recvType) continue;
-        const hit = resolveTypedMember(e.recvType, e.name!, e.file, ownerMethod, classParents, e.argCount);
+        const hit = resolveTypedMember(e.recvType, e.name!, e.file, ownerMethod, classParents, classTraits, e.argCount);
         if (hit === "ambiguous") continue; // drop — never guess past an ambiguous owner
-        if (hit) add(e.source, hit.id, "calls", hit.confidence);
+        if (hit) {
+          add(e.source, hit.id, "calls", hit.confidence);
+          continue;
+        }
+        if (EX_EXT.test(e.file)) {
+          // Elixir: the receiver module exists in the repo but declares no such `def` —
+          // the function is macro-generated (`use Ecto.Repo`, a DSL). The call is still
+          // a real dependency on that module: point the edge at the module node.
+          const mod = moduleByFqn.get(e.recvType);
+          if (mod && mod.id !== e.source && reachable(e.file, mod.path)) {
+            add(e.source, mod.id, "calls", "inferred");
+          }
+          continue;
+        }
         // No owner-qualified match means the call is unresolved. A unique bare
         // method name is not evidence that this receiver has that method — a
         // name-fallback here was measured to HALVE call-edge precision (73%→37%
         // vs a compiler-grade oracle) for a 3x count inflation, i.e. noise. See #35.
-        continue;
+        //
+        // One carve-out, which is NOT that fallback: a Swift `implicitSelf` edge
+        // carries two readings of one bare call — member (tried above, in
+        // Swift's own inner-scope-first order) and free function. Zero members
+        // on the whole owner chain means the call was a free-function call after
+        // all, so it falls through to bare-name resolution; an ambiguous member
+        // set has already dropped it above, and a resolved member never reaches
+        // here — a name defined as both member and free function yields the
+        // member edge alone, exactly as Swift dispatches it.
+        if (!e.implicitSelf) continue;
       }
+      // Every language's bare-name call is a free function, except R (Phase 4):
+      // an untyped `obj$method()` there sets e.kinds to also allow a "method"
+      // match — see extract.ts's calleeName R branch for why (R6 methods are
+      // never kind "function", so without this every such call would be
+      // unconditionally unresolvable rather than just occasionally ambiguous).
       // Three cases, because "a bare call" means something different per tier:
       //
       //  - generic (breadth tier): tags.scm captures ALL calls as bare names, since it
@@ -190,14 +389,54 @@ export function resolveEdges(
       //    extract.ts, so the only bare call reaching here is `new Foo()`, whose target
       //    is a TYPE. Against the function index every constructor edge would drop.
       //  - everything else: functions, exactly as before.
+      //
+      // R (depth tier, Phase 4) sets `e.kinds` itself for an untyped `obj$method()`
+      // (see above), and that explicit choice wins over the per-tier default.
       const srcOrigin = byId.get(e.source)?.origin;
       const callKinds: Kind[] =
-        srcOrigin === "generic"
+        e.kinds ??
+        (srcOrigin === "generic"
           ? ["function", "method"]
           : e.file.endsWith(".java")
             ? ["class", "struct", "enum", "interface"]
-            : ["function"];
-      const hit = resolveName(e.name!, e.file, callKinds, perFileName, globalName);
+            : ["function"]);
+      // A call through a named import (TypeScript, extract.ts) names its module.
+      // An external or unresolved module means the callee is not in this repo:
+      // drop the edge rather than let the unique-name fallback bind it to an
+      // unrelated same-named local function (a test mock, a helper named
+      // `expect`) and report it as a production dependency (#330). An in-repo
+      // module that defines the name resolves to that definition alone; one
+      // that does not (a barrel re-export) keeps the name-based fallback.
+      if (e.specifier) {
+        const targetFile = resolveImport(e.specifier, e.file, byId);
+        if (!byId.has(targetFile)) continue;
+        const inModule = (perFileName.get(targetFile)?.get(e.name!) ?? []).filter((n) =>
+          callKinds.includes(n.kind),
+        );
+        if (inModule.length === 1) {
+          add(e.source, inModule[0].id, "calls", "extracted");
+          continue;
+        }
+        if (inModule.length > 1) continue;
+      }
+      let hit = EX_EXT.test(e.file)
+        ? resolveLocalName(e.name!, e.file, callKinds, perFileName)
+        : resolveName(e.name!, e.file, callKinds, perFileName, globalName);
+      // Python is the Java case without the `new` to mark it: `Widget()` is an
+      // ordinary call node, so a constructor edge dies against the function-only
+      // index. Java can widen to types outright; Python has free functions, so
+      // widening would trade real function edges for type ones. Hence a fallback,
+      // not a swap — types are tried only once functions have found nothing, and
+      // resolveName's same-file-then-unique-global rule still drops the ambiguous.
+      if (!hit && PY_EXT.test(e.file)) {
+        hit = resolveName(e.name!, e.file, PY_CTOR_KINDS, perFileName, globalName);
+      }
+      if (!hit && SWIFT_EXT.test(e.file)) {
+        hit = resolveName(e.name!, e.file, SWIFT_CTOR_KINDS, perFileName, globalName);
+      }
+      if (!hit && KOTLIN_EXT.test(e.file)) {
+        hit = resolveName(e.name!, e.file, KOTLIN_CTOR_KINDS, perFileName, globalName);
+      }
       if (hit) add(e.source, hit.id, "calls", hit.confidence); // drop unresolved calls (too noisy)
     }
   }
@@ -210,10 +449,34 @@ function push<T>(map: Map<string, T[]>, key: string, val: T): void {
   else map.set(key, [val]);
 }
 
+/** Derive a method's owner from its dotted id when extract did not stamp `owner`
+ * (PHP trait/interface methods today). `app.php#Loggable.log` → `Loggable`. */
+function ownerFromMethodId(id: string): string | undefined {
+  const post = id.includes("#") ? id.split("#")[1] : id;
+  const segs = post.split(".");
+  return segs.length >= 2 ? segs[segs.length - 2] : undefined;
+}
+
 /**
  * Resolve a bare symbol name: same-file match first (certain → `extracted`),
  * else a unique cross-file match (→ `inferred`), else null (ambiguous/unknown).
  */
+/**
+ * Same-file only — no cross-file fallback. Elixir: a bare `foo(x)` is a local, imported, or
+ * Kernel function, never another module's, so `resolveName`'s unique-global rule turned every
+ * coincidental name match into a false edge. Remote calls arrive receiver-typed from
+ * extractElixir and never reach this.
+ */
+function resolveLocalName(
+  name: string,
+  file: string,
+  kinds: Kind[],
+  perFileName: Map<string, Map<string, NodeV1[]>>,
+): { id: string; confidence: EdgeV1["confidence"] } | null {
+  const local = (perFileName.get(file)?.get(name) ?? []).filter((n) => kinds.includes(n.kind));
+  return local.length ? { id: local[0].id, confidence: "extracted" } : null;
+}
+
 function resolveName(
   name: string,
   file: string,
@@ -222,10 +485,28 @@ function resolveName(
   globalName: Map<string, NodeV1[]>,
 ): { id: string; confidence: EdgeV1["confidence"] } | null {
   const local = (perFileName.get(file)?.get(name) ?? []).filter((n) => kinds.includes(n.kind));
-  if (local.length) return { id: local[0].id, confidence: "extracted" };
-  const global = (globalName.get(name) ?? []).filter((n) => kinds.includes(n.kind));
+  // Same-file requires a UNIQUE match, exactly as the cross-file branch below does.
+  // Returning `local[0]` meant a file holding two same-named types (`Alpha.Builder` and
+  // `Beta.Builder`, `Alpha.Inner` and `Beta.Inner`) silently resolved to whichever came
+  // first in document order — and labelled it `extracted`, i.e. certain. That is the
+  // guess this module's header says it does not make.
+  if (local.length === 1) return { id: local[0].id, confidence: "extracted" };
+  // Cross-file: also require a language that could actually reach this one.
+  // Without it a unique name match ANYWHERE in the repo wins, which is how a Go
+  // builtin ended up resolving into a TypeScript test — see FAMILIES above.
+  const global = (globalName.get(name) ?? []).filter(
+    (n) =>
+      kinds.includes(n.kind) &&
+      reachable(file, n.path) &&
+      (!file.endsWith(".go") || sameGoPackage(file, n.path)),
+  );
   if (global.length === 1) return { id: global[0].id, confidence: "inferred" };
   return null;
+}
+
+function sameGoPackage(file: string, candidatePath: string): boolean {
+  if (posix.dirname(toPosixPath(file)) !== posix.dirname(toPosixPath(candidatePath))) return false;
+  return file.endsWith("_test.go") || !candidatePath.endsWith("_test.go");
 }
 
 /**
@@ -270,6 +551,7 @@ function resolveTypedMember(
   file: string,
   ownerMethod: Map<string, NodeV1[]>,
   classParents: Map<string, string[]>,
+  classTraits: Map<string, string[]>,
   argCount?: number,
 ): { id: string; confidence: EdgeV1["confidence"] } | "ambiguous" | null {
   const MAX_DEPTH = 3;
@@ -277,16 +559,32 @@ function resolveTypedMember(
   let frontier = [recvType];
   for (let depth = 0; depth <= MAX_DEPTH && frontier.length; depth++) {
     for (const type of frontier) {
-      const all = ownerMethod.get(`${type}.${name}`);
-      if (!all || all.length === 0) continue; // try next ancestor
-      const candidates = narrowByArity(all, argCount);
-      if (candidates.length === 1) {
-        const c = candidates[0];
-        return { id: c.id, confidence: c.path === file ? "extracted" : "inferred" };
+      const all = ownerMethod.get(`${type}.${name}`)?.filter((c) => reachable(file, c.path));
+      if (all && all.length > 0) {
+        const candidates = narrowByArity(all, argCount);
+        if (candidates.length === 1) {
+          const c = candidates[0];
+          return { id: c.id, confidence: c.path === file ? "extracted" : "inferred" };
+        }
+        // Swift: several candidates surviving arity narrowing are a genuine
+        // overload set distinguished only by parameter TYPES (`save(Int)` vs
+        // `save(String)`), which this pass cannot read — the same-file tiebreak
+        // below would pick whichever overload appears first in the file and
+        // stamp it `extracted`, a confidently wrong edge. Drop instead.
+        if (SWIFT_EXT.test(file)) return "ambiguous";
+        // Elixir multi-clause: several `def total(...)` heads of ONE function in one module.
+        // The first clause stands for the function.
+        if (EX_EXT.test(file) && candidates.every((c) => c.path === candidates[0].path)) {
+          const c = candidates[0];
+          return { id: c.id, confidence: c.path === file ? "extracted" : "inferred" };
+        }
+        const sameFile = candidates.find((c) => c.path === file);
+        if (sameFile) return { id: sameFile.id, confidence: "extracted" };
+        return "ambiguous"; // several, none same-file — drop and stop
       }
-      const sameFile = candidates.find((c) => c.path === file);
-      if (sameFile) return { id: sameFile.id, confidence: "extracted" };
-      return "ambiguous"; // several, none same-file — drop and stop
+      const traitHit = resolveTraitMember(type, name, file, ownerMethod, classTraits, argCount);
+      if (traitHit === "ambiguous") return "ambiguous";
+      if (traitHit) return traitHit;
     }
     const next: string[] = [];
     for (const type of frontier) {
@@ -299,6 +597,31 @@ function resolveTypedMember(
     frontier = next;
   }
   return null; // chain exhausted, no candidate anywhere
+}
+
+/** Resolve a member call against methods declared on PHP traits used by `type`. */
+function resolveTraitMember(
+  type: string,
+  name: string,
+  file: string,
+  ownerMethod: Map<string, NodeV1[]>,
+  classTraits: Map<string, string[]>,
+  argCount?: number,
+): { id: string; confidence: EdgeV1["confidence"] } | "ambiguous" | null {
+  const traits = classTraits.get(type);
+  if (!traits?.length) return null;
+  const matches: NodeV1[] = [];
+  for (const trait of traits) {
+    const all = ownerMethod.get(`${trait}.${name}`)?.filter((c) => reachable(file, c.path));
+    if (!all?.length) continue;
+    matches.push(...narrowByArity(all, argCount));
+  }
+  if (matches.length === 0) return null;
+  if (matches.length === 1) {
+    const c = matches[0];
+    return { id: c.id, confidence: c.path === file ? "extracted" : "inferred" };
+  }
+  return "ambiguous";
 }
 
 /**
@@ -395,6 +718,41 @@ function resolvePhpUse(fqn: string, bySuffix: Map<string, string[]>): string {
   return fqn;
 }
 
+const CALLABLE_KINDS: Kind[] = ["function", "method"];
+const TYPE_KINDS: Kind[] = ["class", "interface", "struct", "enum", "type", "module"];
+
+/**
+ * A Gleam type and its constructor idiomatically share a name — `pub type Cfg {
+ * Cfg(…) }` defines both — so a module-scoped lookup finds two candidates and
+ * would drop the edge for the single most common shape in the language. The use
+ * site says which one it meant: `thing.Cfg(…)` applies the constructor,
+ * `x: thing.Cfg` annotates the type. Narrow by kind ONLY when the name is
+ * genuinely doubled, so a lone match still resolves whatever its kind, and only
+ * for Gleam, leaving every other language's specifier lookup untouched.
+ */
+function narrowGleamByKind(candidates: NodeV1[], file: string, kinds: Kind[]): NodeV1[] {
+  if (candidates.length <= 1 || !file.endsWith(".gleam")) return candidates;
+  const narrowed = candidates.filter((c) => kinds.includes(c.kind));
+  return narrowed.length ? narrowed : candidates;
+}
+
+/**
+ * Resolve a Gleam `import app/thing` to the in-repo module file. A Gleam package
+ * roots every module at its `src/` (tests at `test/`), so the import path IS the
+ * file's path-suffix — `app/thing` → `…/app/thing.gleam` — with no per-package
+ * config to consult. Only a unique match resolves; the stdlib, a hex dependency,
+ * and a module name that two packages in one repo both define all stay the raw
+ * module path, so an import never becomes a guessed file edge.
+ */
+function resolveGleamImport(spec: string, bySuffix: Map<string, string[]>): string {
+  const file = `${toPosixPath(spec)}.gleam`;
+  const hits = bySuffix.get(file);
+  // A file's own full path names it exactly (generic.ts scopes same-file names
+  // this way), even when a nested package has a file ending in the same path.
+  if (hits?.includes(file)) return file;
+  return hits && hits.length === 1 ? hits[0] : spec;
+}
+
 /**
  * Resolve a Rust `crate`-relative module path (`crate/a/b`, from `use crate::a::b::Item`)
  * to the in-repo module file — `<crate root>/a/b.rs` or `<crate root>/a/b/mod.rs`, where
@@ -454,6 +812,13 @@ function resolveRustUse(spec: string, file: string, byId: Map<string, NodeV1>, c
  * dir may hold several `.go` files; we pick a deterministic representative (lowest id).
  */
 function resolveGoImport(spec: string, modules: GoModule[], filesByDir: Map<string, string[]>): string {
+  const dir = goImportDir(spec, modules);
+  const files = dir === null ? undefined : filesByDir.get(dir);
+  if (!files || files.length === 0) return spec; // stdlib / third-party — keep the package path
+  return [...files].sort()[0];
+}
+
+function goImportDir(spec: string, modules: GoModule[]): string | null {
   let best: { mod: GoModule; subpath: string } | null = null;
   for (const mod of modules) {
     let subpath: string | null = null;
@@ -462,10 +827,5 @@ function resolveGoImport(spec: string, modules: GoModule[], filesByDir: Map<stri
     if (subpath === null) continue;
     if (!best || mod.module.length > best.mod.module.length) best = { mod, subpath };
   }
-  if (!best) return spec; // stdlib / third-party — keep the package path
-
-  const dir = posix.normalize(posix.join(best.mod.dir, best.subpath));
-  const files = filesByDir.get(dir);
-  if (!files || files.length === 0) return spec;
-  return [...files].sort()[0];
+  return best ? posix.normalize(posix.join(best.mod.dir, best.subpath)) : null;
 }

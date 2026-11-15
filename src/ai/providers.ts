@@ -24,6 +24,10 @@ export interface EngineConfig {
   apiKey?: string;
   /** Model id. Env: GRAFT_MODEL. Provider-specific default. */
   model?: string;
+  /** Model id for the synthesis pass alone (`graft build --synth-model`), so a fast
+   *  non-reasoning model can write the concept nodes while per-file summaries use
+   *  another. Env: GRAFT_SYNTH_MODEL. Default: {@link model}. */
+  synthModel?: string;
   /** Base URL for OpenAI-compatible endpoints. Env: GRAFT_BASE_URL. */
   baseUrl?: string;
 
@@ -44,6 +48,8 @@ export interface ResolvedConfig {
   provider: ProviderKind;
   apiKey?: string;
   model: string;
+  /** The synthesis model: `synthModel` when configured, else {@link model}. */
+  synthModel: string;
   baseUrl?: string;
   headers?: Record<string, string>;
   /** True when the key came from the deprecated OPENROUTER_* fallback. */
@@ -55,11 +61,16 @@ export interface ResolvedConfig {
 }
 
 const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+const ORCAROUTER_BASE_URL = "https://api.orcarouter.ai/v1";
 
 /** Per-provider default model. */
 export const DEFAULT_MODELS: Record<ProviderKind, string> = {
   openai: "openai/gpt-4o-mini",
   anthropic: "claude-sonnet-5",
+  // Provider-prefixed so the LiteLLM proxy routes it; override with GRAFT_MODEL.
+  litellm: "openai/gpt-4o-mini",
+  // Provider-prefixed so the OrcaRouter gateway routes it; override with GRAFT_MODEL.
+  orcarouter: "openai/gpt-4o-mini",
 };
 
 export const DEFAULTS = {
@@ -74,16 +85,25 @@ export function resolveConfig(config: EngineConfig = {}): ResolvedConfig {
 
   const explicitKey = config.apiKey ?? env.GRAFT_API_KEY;
   const legacyKey = env.OPENROUTER_API_KEY;
-  const apiKey = explicitKey ?? legacyKey;
+  const apiKey = explicitKey ?? legacyKey ?? env.ORCAROUTER_API_KEY;
   const usedLegacyEnv = !explicitKey && !!legacyKey;
 
   const model =
-    config.model ?? env.GRAFT_MODEL ?? env.GRAFT_OPENROUTER_MODEL ?? DEFAULT_MODELS[provider];
+    config.model ??
+    env.GRAFT_MODEL ??
+    env.GRAFT_OPENROUTER_MODEL ??
+    env.ORCAROUTER_MODEL ??
+    DEFAULT_MODELS[provider];
 
-  let baseUrl = config.baseUrl ?? env.GRAFT_BASE_URL ?? env.OPENROUTER_BASE_URL;
+  // Synthesis rides the build model unless a synthesis model of its own is set.
+  const synthModel = config.synthModel ?? env.GRAFT_SYNTH_MODEL ?? model;
+
+  let baseUrl = config.baseUrl ?? env.GRAFT_BASE_URL ?? env.OPENROUTER_BASE_URL ?? env.ORCAROUTER_BASE_URL;
   // Back-compat: an existing setup with only OPENROUTER_API_KEY keeps hitting
   // OpenRouter without any config change.
   if (!baseUrl && provider === "openai" && usedLegacyEnv) baseUrl = OPENROUTER_BASE_URL;
+  // The orcarouter provider points at the gateway unless a base URL is given.
+  if (!baseUrl && provider === "orcarouter") baseUrl = ORCAROUTER_BASE_URL;
 
   const headers =
     provider === "openai" && baseUrl?.includes("openrouter.ai")
@@ -95,6 +115,7 @@ export function resolveConfig(config: EngineConfig = {}): ResolvedConfig {
     provider,
     apiKey,
     model,
+    synthModel,
     baseUrl,
     headers,
     usedLegacyEnv,

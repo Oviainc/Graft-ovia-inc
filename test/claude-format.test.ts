@@ -8,6 +8,18 @@ const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, '');
 test('not-built state', () => {
   const lines = renderStatusline(null, null, { ctxPct: null });
   assert.match(strip(lines[0]), /not built/);
+  assert.match(strip(lines[0]), /graft build/);
+});
+
+test('empty graph (0 nodes) is built, not "not built"', () => {
+  // A successful `graft build` on a docs-only repo writes a real graph with
+  // zero symbols. nodeCount === 0 must not be treated as "never built".
+  const stats = { ...emptyStats(), nodeCount: 0, edgeCount: 0 };
+  const line = strip(renderStatusline(stats, null, { ctxPct: null })[0]);
+  assert.doesNotMatch(line, /not built/);
+  assert.doesNotMatch(line, /graft build/);
+  assert.match(line, /0 nodes \/ 0 edges/);
+  assert.match(line, /✓ synced/);
 });
 
 test('two-line bar: size + freshness + ctx + last', () => {
@@ -20,6 +32,12 @@ test('two-line bar: size + freshness + ctx + last', () => {
   assert.match(lines[0], /⚠ 4 stale/);
   assert.match(lines[1], /ctx 34%/);
   assert.match(lines[1], /last: pkce\.ts/);
+});
+
+test('the folder comes first, so terminals in different repos tell apart', () => {
+  const stats = { ...emptyStats(), nodeCount: 5, edgeCount: 6, totalCount: 5 };
+  assert.match(strip(renderStatusline(stats, null, { ctxPct: null, folder: 'api_server' })[0]), /^◤ api_server · (trail|graft) · 5 nodes/);
+  assert.match(strip(renderStatusline(null, null, { ctxPct: null, folder: 'api_server' })[0]), /^◤ api_server · (trail|graft) · not built/);
 });
 
 test('syncing overrides stale; synced when clean', () => {
@@ -52,6 +70,10 @@ test('formatBlastRadius renders callers or null', () => {
   assert.match(strip(txt!), /blast radius for pkce\.ts/);
   assert.match(strip(txt!), /exchange \(client\.ts\)/);
   assert.equal(formatBlastRadius(wiring2, '/abs/repo/src/unknown.ts'), null);
+  // The edited path is the OS's: on Windows '\' separates, elsewhere it is part of a file name.
+  const backslashed = formatBlastRadius(wiring2, '/abs/repo/src\\pkce.ts');
+  if (process.platform === 'win32') assert.match(strip(backslashed ?? ''), /exchange \(client\.ts\)/, 'a Windows path');
+  else assert.equal(backslashed, null, 'a POSIX file name containing a backslash');
 });
 
 test('formatRetrieval renders top hits, trims snippet, first pointer only', () => {
@@ -93,7 +115,7 @@ const gateAsk = (over: Record<string, unknown> = {}) => ({
   ],
   ...over,
 }) as any;
-const freshSession = () => ({ lastQuery: null, perAgentQuery: {}, graftReads: 0, sourceReads: 0, savedTokens: 0, injectedPointers: [] as string[] });
+const freshSession = () => ({ graftReads: 0, sourceReads: 0, savedTokens: 0, injectedPointers: [] as string[] });
 
 test('relevantRetrieval injects on good coverage and records pointers', () => {
   const s = freshSession();
@@ -168,7 +190,11 @@ test('formatOrientation labels and truncates to budget', () => {
   assert.match(out, /Already know the file or symbol to change\?/, 'known-target edit guidance present');
   // index truncated to budget (1500) + the fixed usage directive (per-tool descriptions + discipline).
   assert.match(out, /Refactor, rename, or multi-file change?/, 'refactor blast-radius nudge present');
-  assert.ok(out.length < 3700, 'index trimmed to budget; only the fixed directive adds to it');
+  // The guard is on the INDEX being trimmed, not on the directive's exact byte
+  // count: an untrimmed 3000-char index would land near 5200. The ceiling has
+  // deliberate slack so teaching the directive one more thing (dollar values,
+  // 0.7.x) doesn't fail a test that is watching something else.
+  assert.ok(out.length < 4000, 'index trimmed to budget; only the fixed directive adds to it');
   // Regression: `graft impact` was folded into `graft callers --depth` in 0.6.0 —
   // the always-on directive must teach the current command, not a dead one.
   assert.doesNotMatch(out, /graft impact\b/, 'does not teach the removed `graft impact` command');
@@ -185,13 +211,29 @@ test('formatOrientation prepends a staleness banner when one is supplied', () =>
   assert.doesNotMatch(strip(formatOrientation(md, 1500)), /ahead of your working tree/);
 });
 
-test('renderSubagent shows agent name and its last query', () => {
-  const out = strip(renderSubagent('Explore', { lastQuery: null, perAgentQuery: { Explore: 'pkce flow' }, graftReads: 0, sourceReads: 0 }));
-  assert.match(out, /Explore/);
-  assert.match(out, /pkce flow/);
+test('renderSubagent shows the agent name', () => {
+  const out = strip(renderSubagent('Explore', { graftReads: 2, sourceReads: 0, savedTokens: 0 }));
+  assert.equal(out, '◤ Explore');
 });
 
 test('renderSubagent without a query still shows the agent', () => {
   const out = strip(renderSubagent('Plan', null));
   assert.match(out, /Plan/);
+});
+
+test('renderStatusline carries the dollar value once the session has been billed', () => {
+  const stats = { ...emptyStats(), nodeCount: 1, edgeCount: 0, totalCount: 1 };
+  const s = { ...freshSession(), savedTokens: 100_000, inputCostMicros: 600_000, inputTokensBilled: 1_000_000 };
+  const line = strip(renderStatusline(stats, s as any, { ctxPct: null })[0]);
+  assert.match(line, /~100,000 tok saved · ~\$0\.06/);
+});
+
+test('renderStatusline shows tokens alone until a turn has been billed', () => {
+  // Turn one of every session, and every turn on a host that exposes no
+  // transcript. Tokens are still true; a price nobody measured is not.
+  const stats = { ...emptyStats(), nodeCount: 1, edgeCount: 0, totalCount: 1 };
+  const s = { ...freshSession(), savedTokens: 100_000 };
+  const line = strip(renderStatusline(stats, s as any, { ctxPct: null })[0]);
+  assert.match(line, /~100,000 tok saved/);
+  assert.doesNotMatch(line, /\$/);
 });

@@ -7,10 +7,10 @@
  * {@link listSourceFiles} so its existing importers are unaffected.
  */
 import { statSync } from "node:fs";
-import { resolve } from "node:path";
+import { extname, resolve } from "node:path";
 import { walkDir } from "../ingest/fs.js";
 import { relPosix } from "../util/paths.js";
-import { readFollowSubmodules, readIncludeDirs } from "../util/state.js";
+import { readFollowNestedRepos, readFollowSubmodules, readIncludeDirs } from "../util/state.js";
 import { languageOf, depthExtensions } from "./extract.js";
 import { genericLangOf, genericExtensions } from "./generic.js";
 import { containerLangOf, containerExtensions } from "./container.js";
@@ -25,6 +25,11 @@ export function supportedExtensions(): string[] {
 function normExt(e: string): string {
   const t = e.trim().toLowerCase();
   return t.startsWith(".") ? t : `.${t}`;
+}
+
+/** Canonical selection for the build and its persisted freshness record. */
+export function normalizeExtensions(exts?: readonly string[]): string[] | undefined {
+  return exts?.length ? [...new Set(exts.map(normExt))].sort() : undefined;
 }
 
 /**
@@ -45,20 +50,45 @@ export function unsupportedExtensions(exts: string[]): string[] {
  * none of which ever see a CLI flag) behaves identically to the build that
  * saved those choices.
  */
+/** Keep only files whose repo-relative path is at or under one of `onlyDirs`.
+ * No-op when `onlyDirs` is empty/absent. The whitelist is carried in the graph
+ * itself (the fingerprint records it at build time), never in the source repo,
+ * so a build and the query-path freshness probe read the identical set. */
+export function filterByOnlyDirs(
+  files: string[],
+  root: string,
+  onlyDirs?: ReadonlySet<string>,
+): string[] {
+  if (!onlyDirs || onlyDirs.size === 0) return files;
+  return files.filter((abs) => {
+    const rel = relPosix(root, abs);
+    return [...onlyDirs].some((d) => rel === d || rel.startsWith(`${d}/`));
+  });
+}
+
 export function listSourceFiles(
   root: string,
   outDir: string,
   repoFiles: string[] = walkDir(root, readIncludeDirs(resolve(root)), {
     followSubmodules: readFollowSubmodules(resolve(root)),
+    followNestedRepos: readFollowNestedRepos(resolve(root)),
   }),
+  onlyDirs?: ReadonlySet<string>,
+  extensions?: readonly string[],
 ): string[] {
+  const selected = normalizeExtensions(extensions);
   // A file is a source file if a depth-tier grammar (languageOf), a breadth-tier
   // grammar (genericLangOf) or a container (containerLangOf) claims its extension.
   // All three must agree here or `build` and `check` would enumerate different sets.
-  return repoFiles.filter(
-    (f) =>
-      !f.startsWith(outDir) &&
-      (languageOf(f) !== null || genericLangOf(f) !== null || containerLangOf(f) !== null),
+  return filterByOnlyDirs(
+    repoFiles.filter(
+      (f) =>
+        !f.startsWith(outDir) &&
+        (!selected || selected.includes(extname(f).toLowerCase())) &&
+        (languageOf(f) !== null || genericLangOf(f) !== null || containerLangOf(f) !== null),
+    ),
+    root,
+    onlyDirs,
   );
 }
 
@@ -78,9 +108,15 @@ export interface SourceStat {
  * both the freshness probe and the extraction cache. Files that vanish between
  * the walk and the stat are dropped (same fail-soft posture as `walkDir`).
  */
-export function listSourceStats(root: string, outDir: string, repoFiles?: string[]): SourceStat[] {
+export function listSourceStats(
+  root: string,
+  outDir: string,
+  repoFiles?: string[],
+  onlyDirs?: ReadonlySet<string>,
+  extensions?: readonly string[],
+): SourceStat[] {
   const out: SourceStat[] = [];
-  for (const abs of listSourceFiles(root, outDir, repoFiles)) {
+  for (const abs of listSourceFiles(root, outDir, repoFiles, onlyDirs, extensions)) {
     let s: { size: number; mtimeMs: number };
     try {
       s = statSync(abs);

@@ -17,13 +17,15 @@ import { readFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { walkDir } from "../ingest/fs.js";
 import { contextDirFor, ensureGitignored, ensureSearchable } from "../context/node-file.js";
-import { extractFile, languageLabelOf, languageOf, type RawEdge } from "./extract.js";
-import { extractGeneric, genericLangOf, warmGenericGrammars } from "./generic.js";
-import { containerLangOf, extractContainer, warmContainerGrammars } from "./container.js";
+import { extractFile, languageLabelOf, languageOf, type Language, type RawEdge } from "./extract.js";
+import { extractGeneric, fallbackLangOf, genericLangOf, warmGenericGrammars, type GenericLang } from "./generic.js";
+import { containerLangOf, extractContainer, warmContainerGrammars, type ContainerLang } from "./container.js";
+import { depthReady, missingDepthPackages, warmDepthGrammars } from "./depth-parser.js";
+import type { NativeFallback } from "./native.js";
 import { contentHash } from "../util/id.js";
 import { relPosix } from "../util/paths.js";
 import { readSourceFile } from "../util/source.js";
-import { readFollowSubmodules, readIncludeDirs } from "../util/state.js";
+import { readFollowNestedRepos, readFollowSubmodules, readIncludeDirs } from "../util/state.js";
 import {
   emptyExtractCache,
   readExtractCache,
@@ -32,7 +34,7 @@ import {
 } from "./extract-cache.js";
 import { writeFingerprint } from "./fingerprint.js";
 import { seedGraph, type SeedResult } from "./seed.js";
-import { listSourceStats } from "./source-files.js";
+import { filterByOnlyDirs, listSourceStats, normalizeExtensions } from "./source-files.js";
 import { resolveEdges, type GoModule } from "./resolve.js";
 import { enrichGraph, type EnrichStats } from "./enrich.js";
 import { readGraph, writeGraph, wiringPath } from "./write.js";
@@ -43,6 +45,62 @@ import type { GraphV1, Kind, NodeV1, Relation, ScopeV1 } from "./types.js";
 import type { CruxSummarizer } from "../ai/crux.js";
 
 export { listSourceFiles } from "./source-files.js";
+
+/**
+ * Which tier extracts a file. {@link buildGraph} and `checkGraph` both dispatch on
+ * this, so a tier the build extracts can never be one the check can't see.
+ *
+ * Depth tier (hand-written extractor) when a language claims the file and its
+ * grammar loads (depth-parser.ts). When it doesn't load, the file goes to that
+ * language's stand-in in the breadth tier and `fellBack` names the language. A
+ * container (.vue) is checked before the breadth tier so a future grammar claiming
+ * its extension can't shadow it; anything else goes to the breadth tier (generic
+ * tags.scm over a WASM grammar).
+ */
+export interface FileTier {
+  lang: Language | null;
+  container: ContainerLang | null;
+  generic: GenericLang | null;
+  fellBack: Language | null;
+}
+
+export function tierOf(path: string): FileTier {
+  const depth = languageOf(path);
+  if (depth) {
+    return depthReady(depth)
+      ? { lang: depth, container: null, generic: null, fellBack: null }
+      : { lang: null, container: null, generic: fallbackLangOf(depth), fellBack: depth };
+  }
+  const container = containerLangOf(path);
+  if (container) return { lang: null, container, generic: null, fellBack: null };
+  return { lang: null, container: null, generic: genericLangOf(path), fellBack: null };
+}
+
+/** Load every WASM grammar these files need, before a synchronous parse loop can
+ * call `extractFile`/`extractGeneric`/`extractContainer`: the depth tier's first
+ * (a container's embedded language included), then the breadth tier's, the
+ * containers', and the stand-ins for depth languages whose grammar didn't load. */
+export async function warmGrammarsFor(paths: Iterable<string>): Promise<void> {
+  const list = [...paths];
+  const depth = new Set<Language>();
+  for (const path of list) {
+    const lang = languageOf(path) ?? containerLangOf(path)?.inner;
+    if (lang) depth.add(lang);
+  }
+  await warmDepthGrammars(depth);
+  const generic = new Set<string>();
+  const containers = new Set<string>();
+  for (const path of list) {
+    const t = tierOf(path);
+    if (t.generic) generic.add(t.generic.name);
+    if (t.container) {
+      containers.add(t.container.name);
+      if (!depthReady(t.container.inner)) generic.add(fallbackLangOf(t.container.inner).name);
+    }
+  }
+  await warmGenericGrammars(generic);
+  await warmContainerGrammars(containers);
+}
 
 /** Minimum non-file node count for a discovered sub-scope to stand on its own
  * (over-split guard 3). A scope with fewer nodes than this is folded into the
@@ -70,6 +128,8 @@ function applyMinSubstanceGuard(scopes: ScopeV1[], nodes: NodeV1[]): ScopeV1[] {
 }
 
 export interface GraphBuildOptions {
+  /** Source extensions to include; absent or empty includes every supported language. */
+  extensions?: string[];
   /** Override the output dir (default: `<root>/.context`). */
   contextDir?: string;
   /** Replay unchanged files from the extraction cache instead of re-parsing them
@@ -89,6 +149,10 @@ export interface GraphBuildOptions {
   summarizer?: CruxSummarizer;
   /** Max files summarized in parallel during the Tier-2 pass. Default is set in enrich. */
   concurrency?: number;
+  /** Repo-relative directory prefixes to limit the build to (`--only-dir`). When
+   * set, only files under these prefixes are indexed; the list is recorded in the
+   * fingerprint so the freshness probe enumerates the same set. */
+  onlyDirs?: string[];
   onProgress?: (info: {
     phase: "parse" | "enrich";
     index: number;
@@ -115,7 +179,13 @@ export interface GraphBuildResult {
   byKind: Record<Kind, number>;
   byRelation: Record<Relation, number>;
   languages: string[];
+  /** Languages parsed by a breadth stand-in because their depth grammar didn't load,
+   * and the packages to allow at install to fix it. Absent when everything loaded. */
+  nativeFallback?: NativeFallback;
   meaning: EnrichStats;
+  /** Recoverable Tier-1/build-output errors. These leave a partial graph on
+   * disk, but the CLI must not report the build as successful. */
+  structuralErrors: number;
   errors: string[];
 }
 
@@ -153,10 +223,14 @@ export async function buildGraph(
   // Enumerate once: source extraction, scope discovery, and Go module
   // resolution must agree on the same Git-ignore-aware working-tree view —
   // including the repo's persisted directory and submodule choices.
-  const repoFiles = walkDir(root, readIncludeDirs(root), {
+  const walked = walkDir(root, readIncludeDirs(root), {
     followSubmodules: readFollowSubmodules(root),
+    followNestedRepos: readFollowNestedRepos(root),
   });
-  const files = listSourceStats(root, outDir, repoFiles);
+  const onlyDirs = opts.onlyDirs && opts.onlyDirs.length > 0 ? new Set(opts.onlyDirs) : undefined;
+  const repoFiles = filterByOnlyDirs(walked, root, onlyDirs);
+  const extensions = normalizeExtensions(opts.extensions);
+  const files = listSourceStats(root, outDir, repoFiles, undefined, extensions);
   const discoveredScopes = discoverScopes(root, repoFiles);
 
   const nodes: NodeV1[] = [];
@@ -183,30 +257,35 @@ export async function buildGraph(
   let parsed = 0;
   let reused = 0;
 
-  // Breadth tier: WASM grammars load asynchronously, so warm the ones this repo
-  // needs ONCE here (buildGraph is async) before the synchronous parse loop below
-  // can call extractGeneric. Depth-tier (native) grammars need no warmup.
-  await warmGenericGrammars(
-    new Set(files.map((f) => genericLangOf(f.abs)?.name).filter((n): n is string => !!n)),
-  );
-  // Container tier (.vue and friends) loads its wrapper grammars the same way,
-  // for the same reason: extractContainer runs inside the sync loop below.
-  await warmContainerGrammars(
-    new Set(files.map((f) => containerLangOf(f.abs)?.name).filter((n): n is string => !!n)),
-  );
+  // Every tier's grammars are WASM and load asynchronously, so warm the ones this
+  // repo needs ONCE here (buildGraph is async) before the synchronous parse loop
+  // below can call extractFile/extractGeneric/extractContainer. A depth grammar
+  // that can't load gets its breadth stand-in warmed instead.
+  await warmGrammarsFor(files.map((f) => f.abs));
+  /** Languages whose files went to a stand-in: grammars for the fix, labels for people. */
+  const fellBack = new Set<Language>();
+  const fellBackLabels = new Set<string>();
 
   files.forEach((f, i) => {
     const rel = f.rel;
     opts.onProgress?.({ phase: "parse", index: i, total: files.length, file: rel });
-    // Depth tier (hand-written, native grammar) if a language claims the file;
-    // otherwise the breadth tier (generic tags.scm over a WASM grammar).
-    const lang = languageOf(f.abs);
-    // A container is neither tier: its wrapper grammar only locates the embedded
-    // block, which then goes to the depth-tier extractor. Checked before the
-    // breadth tier so a future grammar claiming .vue can't shadow it.
-    const container = lang ? null : containerLangOf(f.abs);
-    const generic = lang || container ? null : genericLangOf(f.abs);
+    const { lang, container, generic, fellBack: standIn } = tierOf(f.abs);
     const label = languageLabelOf(f.abs) ?? container?.name ?? generic?.name ?? "unknown";
+    // A .vue file's embedded script falls back the same way its language does.
+    const inner = container && !depthReady(container.inner) ? container.inner : null;
+    if (standIn) {
+      fellBack.add(standIn);
+      fellBackLabels.add(label);
+    }
+    if (inner) {
+      fellBack.add(inner);
+      fellBackLabels.add(inner);
+    }
+    // Which stand-in parsed this file, if one did. A cached parse is replayed only
+    // when the same parser would produce it now: otherwise a file parsed by the
+    // stand-in would keep its basic parse after a reinstall restored the native
+    // grammar, for as long as its bytes didn't change.
+    const via = standIn ? generic!.name : inner ? fallbackLangOf(inner).name : undefined;
     const cached = priorExtract.files[rel];
 
     // Every file is read and hashed, every build — only the *parse* is memoized.
@@ -237,14 +316,19 @@ export async function buildGraph(
     }
 
     const hash = contentHash(source);
-    if (cached && hash === cached.hash) {
+    // A cached `error` is not a parse result, it is the absence of one — and the
+    // absence need not be the file's fault. A wasm grammar that aborts because the
+    // run before it exhausted the heap fails whichever file happened to be in
+    // flight, so that error belongs to the *run*, not to the bytes this entry is
+    // keyed on. Replaying it pins the accident to the content hash: an untouched
+    // file stays broken on every later build, and a whole language can vanish from
+    // a graph that still exits 0 (#312). So an entry carrying an error falls
+    // through and is re-parsed — it produced no nodes, which is exactly what makes
+    // re-parsing it affordable, and a run that now succeeds repairs the entry.
+    if (cached && hash === cached.hash && cached.via === via && !cached.error) {
       entries[rel] = { ...cached, size: f.size, mtimeMs: f.mtimeMs };
       sources.set(rel, source);
       reused++;
-      if (cached.error) {
-        errors.push(cached.error); // this file failed to parse last time too
-        return;
-      }
       nodes.push(...cached.nodes);
       rawEdges.push(...cached.rawEdges);
       langs.add(label);
@@ -262,11 +346,11 @@ export async function buildGraph(
       rawEdges.push(...fileEdges);
       sources.set(rel, source);
       langs.add(label);
-      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash, nodes: fileNodes, rawEdges: fileEdges };
+      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash, nodes: fileNodes, rawEdges: fileEdges, ...(via ? { via } : {}) };
     } catch (err) {
       const message = `${rel}: parse failed — ${err instanceof Error ? err.message : String(err)}`;
       errors.push(message);
-      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash, nodes: [], rawEdges: [], error: message };
+      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash, nodes: [], rawEdges: [], error: message, ...(via ? { via } : {}) };
     }
   });
 
@@ -283,8 +367,30 @@ export async function buildGraph(
 
   const edges = resolveEdges(nodes, rawEdges, { goModules: readGoModules(root, repoFiles) });
 
+  // Guard 5 (minimum-substance): node counts aren't known until nodes are
+  // assembled, so the merge-tiny-scopes-into-root guard runs here.
+  const scopes = applyMinSubstanceGuard(discoveredScopes, nodes);
+
+  // Assemble the graph BEFORE the meaning pass, so the crux pass can checkpoint it to
+  // disk periodically (#128): crux/summary mutate node objects in place and never
+  // change the node/edge SET, so `meta` stays valid; the opt-in LSP pass below is the
+  // only thing that adds edges, and it runs before the final write.
+  const graph: GraphV1 = {
+    meta: {
+      version: 1,
+      nodeCount: nodes.length,
+      edgeCount: edges.length,
+      languages: [...langs].sort(),
+      extensions,
+      scopes,
+    },
+    nodes,
+    edges,
+  };
+
   // graph.json is its own Tier-2 cache: fold in the prior meaning layer so an
   // unchanged body is never re-summarized (and a Tier-1-only run never wipes it).
+  // Read BEFORE the first checkpoint can overwrite wiring.json.
   const prior = readGraph(wiringPath(outDir));
   const priorById = new Map((prior?.nodes ?? []).map((n) => [n.id, n]));
   const meaning = await enrichGraph(nodes, priorById, sources, {
@@ -292,24 +398,11 @@ export async function buildGraph(
     concurrency: opts.concurrency,
     onProgress: ({ index, total, node }) =>
       opts.onProgress?.({ phase: "enrich", index, total, file: node }),
+    // Periodic durability flush of partial crux; the next run folds it back in by
+    // body_hash, so an interrupted --deep run never repays the crux it computed.
+    checkpoint: () => writeGraph(graph, outDir),
   });
   errors.push(...meaning.errors);
-
-  // Guard 5 (minimum-substance): node counts aren't known until nodes are
-  // assembled, so the merge-tiny-scopes-into-root guard runs here.
-  const scopes = applyMinSubstanceGuard(discoveredScopes, nodes);
-
-  const graph: GraphV1 = {
-    meta: {
-      version: 1,
-      nodeCount: nodes.length,
-      edgeCount: edges.length,
-      languages: [...langs].sort(),
-      scopes,
-    },
-    nodes,
-    edges,
-  };
 
   // Opt-in compiler-grade enrichment (adds lsp_resolved call edges in place).
   // Runs on the assembled graph so callee positions map back to nodes; never
@@ -318,7 +411,7 @@ export async function buildGraph(
     const { enrichWithLsp } = await import("./lsp/enrich.js");
     const r = await enrichWithLsp(graph, root);
     graph.meta.edgeCount = graph.edges.length;
-    opts.onProgress?.({ phase: "enrich", index: r.added, total: r.queried, file: `lsp:${r.server ?? "none"}` });
+    opts.onProgress?.({ phase: "enrich", index: r.added, total: r.queried, file: `lsp:${r.servers.join(", ") || "none"}` });
   }
 
   const graphPath = writeGraph(graph, outDir);
@@ -343,7 +436,7 @@ export async function buildGraph(
   // these source bytes." Nothing about the projections below — which is why it is
   // safe to write here, and why `graphOnly` builds (the query path, which stops
   // right after this line) are still recorded as fresh.
-  writeFingerprint(outDir, entries);
+  writeFingerprint(outDir, entries, opts.onlyDirs, extensions);
 
   // Tier-2 passive surface: project the nodes into per-file markdown cards, and
   // refresh the INDEX roster. Pure projection — no LLM, no network.
@@ -389,7 +482,11 @@ export async function buildGraph(
     byKind,
     byRelation,
     languages: [...langs].sort(),
+    ...(fellBack.size > 0
+      ? { nativeFallback: { languages: [...fellBackLabels].sort(), packages: missingDepthPackages(fellBack) } }
+      : {}),
     meaning,
+    structuralErrors: errors.length - meaning.errors.length,
     errors,
   };
 }

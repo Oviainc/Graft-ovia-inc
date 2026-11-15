@@ -3,7 +3,7 @@
  * stay per-scope instead of pooling a monorepo's biggest sub-project against
  * everything else. A "scope" is rooted at a directory that carries a
  * project-marker file (`package.json`, `go.mod`, `pyproject.toml`, `setup.py`,
- * `Cargo.toml`).
+ * `Cargo.toml`, `pom.xml`, `build.gradle`, `build.gradle.kts`).
  *
  * Discovery rules (see task brief for the numbered spec):
  *  1. Any directory with >=1 marker file is a scope candidate.
@@ -21,15 +21,15 @@
  *  7. `label` = `prefix` (both "" for root); ordering is prefix-length desc,
  *     then lexicographic.
  */
-import { existsSync, readdirSync, readFileSync, type Dirent } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync, type Dirent } from "node:fs";
+import { join, resolve, sep } from "node:path";
 import { shouldSkipDir, walkDir } from "../ingest/fs.js";
 import { relPosix } from "../util/paths.js";
-import { readFollowSubmodules, readIncludeDirs } from "../util/state.js";
+import { readFollowNestedRepos, readFollowSubmodules, readIncludeDirs } from "../util/state.js";
 import type { GraphV1, ScopeV1 } from "./types.js";
 
 /** Project-marker files, checked in this order (also the order `markers` is built in). */
-const MARKERS = ["package.json", "go.mod", "pyproject.toml", "setup.py", "Cargo.toml"];
+const MARKERS = ["package.json", "go.mod", "pyproject.toml", "setup.py", "Cargo.toml", "composer.json", "pom.xml", "build.gradle", "build.gradle.kts"];
 
 const CANONICAL_ROOT: ScopeV1[] = [{ prefix: "", label: "", markers: [] }];
 
@@ -134,6 +134,7 @@ export function discoverScopes(
   root: string,
   repoFiles: string[] = walkDir(root, readIncludeDirs(resolve(root)), {
     followSubmodules: readFollowSubmodules(resolve(root)),
+    followNestedRepos: readFollowNestedRepos(resolve(root)),
   }),
 ): ScopeV1[] {
   const absRoot = resolve(root);
@@ -335,8 +336,30 @@ export function discoverWorkspaceChildren(root: string): string[] {
     return [];
   }
   return entries
-    .filter((e) => e.isDirectory() && !shouldSkipDir(e.name, includes) && existsSync(join(absRoot, e.name, ".git")))
+    .filter(
+      (e) =>
+        isChildDirectory(absRoot, e) && !shouldSkipDir(e.name, includes) && existsSync(join(absRoot, e.name, ".git")),
+    )
     .map((e) => e.name);
+}
+
+/** A workspace child is a real directory, or a symlink to one: ticket workspaces
+ * are routinely assembled from worktrees plus symlinks to the repos a change
+ * touches, and `Dirent.isDirectory()` is false for a symlink. A symlinked child
+ * is followed one level, like `walkDir` follows a symlinked root. Dangling links
+ * and links that point back at the workspace root or one of its ancestors (a
+ * cycle) are not children. */
+function isChildDirectory(absRoot: string, e: Dirent): boolean {
+  if (e.isDirectory()) return true;
+  if (!e.isSymbolicLink()) return false;
+  try {
+    const target = realpathSync(join(absRoot, e.name));
+    const root = realpathSync(absRoot);
+    if (target === root || root.startsWith(target + sep)) return false;
+    return statSync(target).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 /** Every consumer's entry point to a graph's scopes: absent `meta.scopes` (old
